@@ -13,7 +13,9 @@ from aiogram.types import BotCommand
 
 app = Flask(__name__)
 
-# --- GitHub Загрузка ---
+# ============================================================
+# 1. ЗАГРУЗКА НА GITHUB
+# ============================================================
 def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     headers = {
         "Authorization": f"token {settings.github_token}",
@@ -37,7 +39,9 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     
     return upload_resp.json()["browser_download_url"]
 
-# --- Уведомление в ТГ ---
+# ============================================================
+# 2. УВЕДОМЛЕНИЯ В TELEGRAM
+# ============================================================
 def send_telegram_notification(chat_id, text):
     if not chat_id: return
     url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
@@ -47,7 +51,9 @@ def send_telegram_notification(chat_id, text):
     except Exception as e:
         print(f"Ошибка уведомления ТГ: {e}")
 
-# --- HTML Шаблон ---
+# ============================================================
+# 3. HTML ШАБЛОН САЙТА
+# ============================================================
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -55,24 +61,28 @@ HTML = """
     <title>Загрузка аудио</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: system-ui; padding: 20px; background: #12121a; color: white; text-align: center; }
-        form { max-width: 400px; margin: 0 auto; background: #1a1a26; padding: 20px; border-radius: 10px; text-align: left; }
-        input { width: 100%; padding: 10px; margin: 10px 0; background: #2a2a3d; border: 1px solid #3f3f5a; color: white; border-radius: 5px; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #7c3aed; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        body { font-family: system-ui, sans-serif; padding: 20px; background: #12121a; color: white; display: flex; justify-content: center; align-items: center; min-height: 80vh; }
+        form { width: 100%; max-width: 400px; background: #1a1a26; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        h2 { margin-top: 0; text-align: center; color: #7c3aed; }
+        input { width: 100%; padding: 12px; margin: 10px 0 20px 0; background: #2a2a3d; border: 1px solid #3f3f5a; color: white; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 14px; background: #7c3aed; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; transition: background 0.2s; }
         button:hover { background: #6d28d9; }
-        .msg { padding: 10px; margin-top: 15px; border-radius: 5px; background: #23233a; color: #f59e0b; word-break: break-all; }
+        .msg { padding: 12px; margin-top: 20px; border-radius: 6px; background: #23233a; color: #f59e0b; word-break: break-all; text-align: center; }
+        label { font-size: 14px; color: #8a8aa0; }
     </style>
 </head>
 <body>
-    <h2>Загрузка аудио</h2>
     <form method="POST" enctype="multipart/form-data">
+        <h2>Загрузка аудио</h2>
         <label>ID Урока (из бота):</label>
-        <input type="number" name="lesson_id" required>
+        <input type="number" name="lesson_id" required placeholder="Например: 5">
+        
         <label>Аудиофайл (MP3/OGG):</label>
         <input type="file" name="audio" accept="audio/*" required>
+        
         <button type="submit">Загрузить на GitHub</button>
+        {% if message %}<div class="msg">{{ message }}</div>{% endif %}
     </form>
-    {% if message %}<div class="msg">{{ message }}</div>{% endif %}
 </body>
 </html>
 """
@@ -98,9 +108,8 @@ def upload():
 
         try:
             chat_id = update_audio_url(int(lesson_id), audio_url)
-            message = f"Успех! Аудио привязано к уроку {lesson_id}."
+            message = f"✅ Успех! Аудио привязано к уроку {lesson_id}."
             
-            # Отправляем уведомление
             send_telegram_notification(
                 chat_id, 
                 f"✅ **Аудио успешно загружено!**\n\nУрок ID: `{lesson_id}`\n[Ссылка]({audio_url})"
@@ -110,25 +119,32 @@ def upload():
 
     return render_template_string(HTML, message=message)
 
-# --- Запуск Бота в фоне ---
+# ============================================================
+# 4. ЗАПУСК БОТА В ФОНЕ
+# ============================================================
 async def start_bot():
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
     dp.include_router(router)
     
-    # Устанавливаем команды
     await bot.set_my_commands([BotCommand(command="start", description="Добавить урок")])
     
     print("Бот запущен в фоне...")
-    await dp.start_polling(bot)
+    # ВАЖНО: handle_signals=False нужен, чтобы aiogram не падал в отдельном потоке
+    await dp.start_polling(bot, handle_signals=False)
 
 def run_bot_thread():
     asyncio.run(start_bot())
 
+# ============================================================
+# 5. ТОЧКА ВХОДА
+# ============================================================
 if __name__ == '__main__':
     init_db()
-    # Запускаем бота
+    
+    # Запускаем бота в фоновом потоке
     threading.Thread(target=run_bot_thread, daemon=True).start()
-    # Запускаем сайт (Render передает порт в переменной PORT)
+    
+    # Запускаем Flask-сайт (Render автоматически подставит нужный порт в PORT)
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
