@@ -14,8 +14,6 @@ class Settings(BaseSettings):
     github_token: str = Field(..., alias="GITHUB_TOKEN")
     github_repo: str = Field(..., alias="GITHUB_REPO")
     db_path: str = Field("books.db", alias="DB_PATH")
-
-    # admin_ids храним строкой в env, парсим в свойство
     admin_ids_raw: str = Field("", alias="ADMIN_IDS")
 
     @property
