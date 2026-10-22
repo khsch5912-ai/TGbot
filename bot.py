@@ -1,16 +1,14 @@
 import re
-from aiogram import Bot, Dispatcher, F, Router
+import sqlite3
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import settings
-from database import get_or_create_book, get_last_book, save_lesson, delete_lesson, save_video
-import sqlite3
-import json
+from database import get_or_create_book, save_lesson, delete_lesson, save_video
 
-# Состояния
 class LessonForm(StatesGroup):
     book_title = State()
     author = State()
@@ -24,36 +22,27 @@ class VideoForm(StatesGroup):
 
 router = Router()
 
-# ============================================================
-# 1. СТАРТ И ИНСТРУКЦИЯ
-# ============================================================
+# === СТАРТ ===
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    if settings.admin_ids and message.from_user.id not in settings.admin_ids:
-        await message.answer("⛔ У тебя нет прав.")
-        return
-
     await state.clear()
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить новый контент", callback_data="menu_new")],
-        [InlineKeyboardButton(text="📚 Посмотреть всё что есть", callback_data="menu_all")]
+        [InlineKeyboardButton(text="➕ Добавить контент", callback_data="menu_new")],
+        [InlineKeyboardButton(text="📚 Посмотреть всё", callback_data="menu_all")]
     ])
-    
     text = (
-        "👋 **Привет! Я бот для управления библиотекой.**\n\n"
-        "Вот что я умею:\n"
-        "🔹 `/new` — добавить новый аудиоурок или видеоурок.\n"
-        "🔹 `/all` — посмотреть списки всех книг и видео.\n"
-        "🔹 `/delete ID` — удалить урок по его ID.\n\n"
-        "Выбери действие на кнопках ниже:"
+        "👋 **Привет! Я бот управления библиотекой.**\n\n"
+        "🔹 `/new` — добавить аудио или видео.\n"
+        "🔹 `/all` — посмотреть всё, что есть.\n"
+        "🔹 `/delete ID` — удалить урок.\n\n"
+        "Выбери действие:"
     )
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 @router.callback_query(F.data == "menu_new")
-async def menu_new(callback: CallbackQuery, state: FSMContext):
+async def menu_new(callback: CallbackQuery):
     await callback.message.edit_text(
-        "Что именно ты хочешь добавить?",
+        "Что добавим?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎧 Аудиоурок", callback_data="new_audio")],
             [InlineKeyboardButton(text="🎬 Видеоурок", callback_data="new_video")],
@@ -65,17 +54,22 @@ async def menu_new(callback: CallbackQuery, state: FSMContext):
 async def menu_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить новый контент", callback_data="menu_new")],
-        [InlineKeyboardButton(text="📚 Посмотреть всё что есть", callback_data="menu_all")]
+        [InlineKeyboardButton(text="➕ Добавить контент", callback_data="menu_new")],
+        [InlineKeyboardButton(text="📚 Посмотреть всё", callback_data="menu_all")]
     ])
     await callback.message.edit_text("Главное меню:", reply_markup=kb)
 
-# ============================================================
-# 2. ДОБАВЛЕНИЕ АУДИО (/new -> Аудиоурок)
-# ============================================================
+@router.message(Command("new"))
+async def cmd_new(message: Message):
+    await message.answer("Что добавим?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎧 Аудиоурок", callback_data="new_audio")],
+        [InlineKeyboardButton(text="🎬 Видеоурок", callback_data="new_video")]
+    ]))
+
+# === ДОБАВЛЕНИЕ АУДИО ===
 @router.callback_query(F.data == "new_audio")
 async def start_new_audio(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🎧 **Добавление аудиоурока**\n\n**Шаг 1:** Введи название книги:")
+    await callback.message.edit_text("🎧 **Шаг 1:** Введи название книги:")
     await state.set_state(LessonForm.book_title)
 
 @router.message(LessonForm.book_title)
@@ -89,7 +83,6 @@ async def process_author(message: Message, state: FSMContext):
     author = message.text.strip()
     data = await state.get_data()
     book_id = get_or_create_book(data["book_title"], author)
-    
     await state.update_data(book_id=book_id, author=author)
     await message.answer("**Шаг 3:** Введи номер урока (можно 2️⃣0️⃣):")
     await state.set_state(LessonForm.lesson_number)
@@ -101,7 +94,7 @@ async def process_lesson_number(message: Message, state: FSMContext):
         await message.answer("❌ Не понял номер. Введи число:")
         return
     await state.update_data(lesson_number=int(text))
-    await message.answer("**Шаг 4:** Введи название темы (например: *Книга намаза*):")
+    await message.answer("**Шаг 4:** Введи название темы:")
     await state.set_state(LessonForm.lesson_title)
 
 @router.message(LessonForm.lesson_title)
@@ -114,144 +107,87 @@ async def process_lesson_title(message: Message, state: FSMContext):
 async def process_sections(message: Message, state: FSMContext):
     sections = [s.strip() for s in message.text.strip().split('\n') if s.strip()]
     data = await state.get_data()
-    data.update({
-        "sections": sections,
-        "uploaded_by": message.from_user.id,
-        "uploaded_by_name": message.from_user.full_name,
-        "audio_url": "" # пока пусто
-    })
-    
+    data.update({"sections": sections, "uploaded_by": message.from_user.id, "uploaded_by_name": message.from_user.full_name})
     try:
         lesson_id = save_lesson(data)
     except Exception as e:
         await message.answer(f"❌ Ошибка БД: {e}")
         await state.clear()
         return
-
-    report = (
-        f"✅ **Аудиоурок создан!**\n\n"
-        f"📕 Книга: {data['book_title']}\n"
-        f"📌 Урок: {data['lesson_number']}\n"
-        f"🆔 **ID: `{lesson_id}`**\n\n"
-        f"👇 Перейди на сайт, чтобы загрузить аудиофайл:"
-    )
-    
-    await message.answer(report, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(f"✅ **Урок создан!**\nID: `{lesson_id}`\nЗайди на `/admin` сайта, чтобы загрузить аудио.", parse_mode=ParseMode.MARKDOWN)
     await state.clear()
 
-# ============================================================
-# 3. ДОБАВЛЕНИЕ ВИДЕО (/new -> Видеоурок)
-# ============================================================
+# === ДОБАВЛЕНИЕ ВИДЕО ===
 @router.callback_query(F.data == "new_video")
 async def start_new_video(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🎬 **Добавление видеоурока**\n\n**Шаг 1:** Введи название видео:")
+    await callback.message.edit_text("🎬 **Шаг 1:** Введи название видео:")
     await state.set_state(VideoForm.title)
 
 @router.message(VideoForm.title)
 async def process_video_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
-    await message.answer("**Шаг 2:** Отправь ссылку на видео (YouTube / VK / Rutube):")
+    await message.answer("**Шаг 2:** Отправь ссылку на видео (YouTube):")
     await state.set_state(VideoForm.url)
 
 @router.message(VideoForm.url)
 async def process_video_url(message: Message, state: FSMContext):
     url = message.text.strip()
     if not url.startswith("http"):
-        await message.answer("❌ Это не похоже на ссылку. Отправь ссылку (начиная с http):")
+        await message.answer("❌ Это не ссылка. Отправь ссылку (http...):")
         return
-
     data = await state.get_data()
     try:
-        video_id = save_video(
-            title=data["title"], 
-            url=url, 
-            user_id=message.from_user.id, 
-            user_name=message.from_user.full_name
-        )
+        save_video(title=data["title"], url=url, user_id=message.from_user.id, user_name=message.from_user.full_name)
     except Exception as e:
         await message.answer(f"❌ Ошибка БД: {e}")
         await state.clear()
         return
-
-    await message.answer(
-        f"✅ **Видеоурок сохранен!**\n\n"
-        f"🎬 Название: {data['title']}\n"
-        f"🆔 **ID видео: `{video_id}`**",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await message.answer(f"✅ **Видеоурок сохранен!**", parse_mode=ParseMode.MARKDOWN)
     await state.clear()
 
-# ============================================================
-# 4. ПРОСМОТР ВСЕГО КОНТЕНТА (/all)
-# ============================================================
+# === ВСЕ КОНТЕНТ ===
 @router.message(Command("all"))
 async def cmd_all(message: Message):
-    if settings.admin_ids and message.from_user.id not in settings.admin_ids:
-        return
-
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
-
-    # 1. Собираем аудио
-    c.execute("""
-        SELECT b.title, b.author, l.id, l.lesson_number, l.lesson_title, l.audio_url 
-        FROM lessons l
-        JOIN books b ON l.book_id = b.id
-        ORDER BY b.title, l.lesson_number
-    """)
+    c.execute("SELECT b.title, b.author, l.id, l.lesson_number, l.lesson_title, l.audio_url FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number")
     lessons = c.fetchall()
-
-    # 2. Собираем видео
     c.execute("SELECT id, title, video_url FROM videos ORDER BY id DESC")
     videos = c.fetchall()
     conn.close()
 
-    text = "📚 **Твоя библиотека:**\n\n"
-
-    # Выводим аудио
-    text += "🎧 **Аудиоуроки:**\n"
+    text = "📚 **Твоя библиотека:**\n\n🎧 **Аудиоуроки:**\n"
     if not lessons:
-        text += "_Пока нет ни одного аудиоурока._\n"
+        text += "_Нет уроков._\n"
     else:
         current_book = ""
         for l in lessons:
-            book_title, author, l_id, l_num, l_title, audio_url = l
-            if book_title != current_book:
-                text += f"\n📕 **{book_title}** ({author})\n"
-                current_book = book_title
-            
-            status = "✅" if audio_url else "⏳ (нет аудио)"
-            text += f"  • [ID: {l_id}] Урок {l_num}: {l_title} {status}\n"
+            if l[0] != current_book:
+                text += f"\n📕 **{l[0]}** ({l[1]})\n"
+                current_book = l[0]
+            status = "✅" if l[5] else "⏳"
+            text += f"  • [ID: {l[2]}] Урок {l[3]}: {l[4]} {status}\n"
 
-    # Выводим видео
     text += "\n🎬 **Видеоуроки:**\n"
     if not videos:
-        text += "_Пока нет ни одного видеоурока._\n"
+        text += "_Нет видео._\n"
     else:
         for v in videos:
-            v_id, v_title, v_url = v
-            text += f"  • [ID: {v_id}] [{v_title}]({v_url})\n"
-
+            text += f"  • [ID: {v[0]}] [{v[1]}]({v[2]})\n"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-
-# ============================================================
-# 5. УДАЛЕНИЕ (/delete ID)
-# ============================================================
+# === УДАЛЕНИЕ ===
 @router.message(Command("delete"))
 async def cmd_delete(message: Message):
-    if settings.admin_ids and message.from_user.id not in settings.admin_ids:
-        return
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("Используй: `/delete ID` (ID можно посмотреть в `/all`)")
+        await message.answer("Используй: `/delete ID`")
         return
-    
     try:
         lesson_id = int(args[1])
         if delete_lesson(lesson_id):
-            await message.answer(f"🗑 Урок/видео с ID {lesson_id} удален из базы.")
+            await message.answer(f"🗑 Урок {lesson_id} удален.")
         else:
-            await message.answer(f"⚠️ Запись с ID {lesson_id} не найдена (или это видео, удаление видео пока не поддерживается).")
+            await message.answer(f"⚠️ Урок {lesson_id} не найден.")
     except ValueError:
         await message.answer("ID должен быть числом.")
