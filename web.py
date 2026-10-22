@@ -13,9 +13,6 @@ from aiogram.types import BotCommand
 
 app = Flask(__name__)
 
-# ============================================================
-# 1. ЗАГРУЗКА НА GITHUB
-# ============================================================
 def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     headers = {
         "Authorization": f"token {settings.github_token}",
@@ -36,12 +33,8 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     file_bytes.seek(0)
     upload_resp = requests.post(f"{upload_url}?name={filename}", headers=upload_headers, data=file_bytes.getvalue(), timeout=120)
     upload_resp.raise_for_status()
-    
     return upload_resp.json()["browser_download_url"]
 
-# ============================================================
-# 2. УВЕДОМЛЕНИЯ В TELEGRAM
-# ============================================================
 def send_telegram_notification(chat_id, text):
     if not chat_id: return
     url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
@@ -49,11 +42,8 @@ def send_telegram_notification(chat_id, text):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Ошибка уведомления ТГ: {e}")
+        print(f"Ошибка уведомления: {e}")
 
-# ============================================================
-# 3. HTML ШАБЛОН САЙТА
-# ============================================================
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -119,32 +109,19 @@ def upload():
 
     return render_template_string(HTML, message=message)
 
-# ============================================================
-# 4. ЗАПУСК БОТА В ФОНЕ
-# ============================================================
 async def start_bot():
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
     dp.include_router(router)
-    
-    await bot.set_my_commands([BotCommand(command="start", description="Добавить урок")])
-    
+    await bot.set_my_commands([BotCommand(command="start", description="Добавить урок"), BotCommand(command="delete", description="Удалить урок")])
     print("Бот запущен в фоне...")
-    # ВАЖНО: handle_signals=False нужен, чтобы aiogram не падал в отдельном потоке
     await dp.start_polling(bot, handle_signals=False)
 
 def run_bot_thread():
     asyncio.run(start_bot())
 
-# ============================================================
-# 5. ТОЧКА ВХОДА
-# ============================================================
 if __name__ == '__main__':
     init_db()
-    
-    # Запускаем бота в фоновом потоке
     threading.Thread(target=run_bot_thread, daemon=True).start()
-    
-    # Запускаем Flask-сайт (Render автоматически подставит нужный порт в PORT)
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
