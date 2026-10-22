@@ -125,3 +125,18 @@ if __name__ == '__main__':
     threading.Thread(target=run_bot_thread, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
+    # В функции start_bot() обнови установку команд:
+async def start_bot():
+    bot = Bot(token=settings.bot_token)
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    # Добавили команду /video
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Добавить аудиоурок"),
+        BotCommand(command="video", description="Добавить видеоурок"),
+        BotCommand(command="delete", description="Удалить урок")
+    ])
+    
+    print("Бот запущен в фоне...")
+    await dp.start_polling(bot, handle_signals=False)
