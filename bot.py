@@ -8,6 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from config import settings
 from database import save_lesson
 
+# Карта для перевода эмодзи-цифр (если пользователь введет 2️⃣0️⃣)
 EMOJI_DIGIT_MAP = {
     '\u0030\ufe0f\u20e3': '0', '\u0031\ufe0f\u20e3': '1',
     '\u0032\ufe0f\u20e3': '2', '\u0033\ufe0f\u20e3': '3',
@@ -21,6 +22,7 @@ def emoji_digits_to_int(text: str) -> str:
         text = text.replace(emoji, digit)
     return text
 
+# Шаги диалога
 class LessonForm(StatesGroup):
     book_title = State()
     author = State()
@@ -33,11 +35,15 @@ router = Router()
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     if settings.admin_ids and message.from_user.id not in settings.admin_ids:
-        await message.answer("⛔ У тебя нет прав.")
+        await message.answer("⛔ У тебя нет прав на добавление уроков.")
         return
 
     await state.clear()
-    await message.answer("👋 Давай добавим новый урок.\n\n**Шаг 1 из 5:** Введи название книги:")
+    await message.answer(
+        "👋 Привет! Давай добавим новый урок.\n"
+        "Я буду задавать вопросы по очереди.\n\n"
+        "**Шаг 1 из 5:** Введи название книги (например: *Далиль ат-Талиб*):"
+    )
     await state.set_state(LessonForm.book_title)
 
 @router.message(LessonForm.book_title)
@@ -49,7 +55,10 @@ async def process_book_title(message: Message, state: FSMContext):
 @router.message(LessonForm.author)
 async def process_author(message: Message, state: FSMContext):
     await state.update_data(author=message.text.strip())
-    await message.answer("**Шаг 3 из 5:** Введи номер урока (можно эмодзи 2️⃣0️⃣):")
+    await message.answer(
+        "**Шаг 3 из 5:** Введи номер урока.\n"
+        "Можно обычными цифрами (20) или эмодзи (2️⃣0️⃣):"
+    )
     await state.set_state(LessonForm.lesson_number)
 
 @router.message(LessonForm.lesson_number)
@@ -68,7 +77,12 @@ async def process_lesson_number(message: Message, state: FSMContext):
 @router.message(LessonForm.lesson_title)
 async def process_lesson_title(message: Message, state: FSMContext):
     await state.update_data(lesson_title=message.text.strip())
-    await message.answer("**Шаг 5 из 5:** Перечисли подразделы (каждый с новой строки):")
+    await message.answer(
+        "**Шаг 5 из 5:** Перечисли подразделы.\n"
+        "Отправь их одним сообщением, каждый с новой строки:\n\n"
+        "Добровольные молитвы\n"
+        "Обязательные молитвы"
+    )
     await state.set_state(LessonForm.sections)
 
 @router.message(LessonForm.sections)
@@ -83,20 +97,27 @@ async def process_sections(message: Message, state: FSMContext):
         "uploaded_by_name": message.from_user.full_name,
     })
     
+    # Сохраняем в БД
     try:
         lesson_id = save_lesson(data)
     except Exception as e:
-        await message.answer(f"❌ Ошибка БД: {e}")
+        await message.answer(f"❌ Ошибка сохранения в БД: {e}")
         await state.clear()
         return
 
+    # Генерируем красивый итоговый шаблон для пользователя
+    formatted_template = (
+        f"📕 Книга «{data['book_title']}»\n"
+        f"📘 Автор: {data['author']}\n\n"
+        f"📌 Урок {data['lesson_number']}\n\n"
+        f"📖 {data['lesson_title']} :\n"
+        f"Разделы:\n" + "\n".join([f"- {s}" for s in sections])
+    )
+
     report = (
-        f"✅ **Урок создан в БД!**\n\n"
-        f"📕 Книга: {data['book_title']}\n"
-        f"📘 Автор: {data['author']}\n"
-        f"📌 Урок: {data['lesson_number']}\n"
-        f"📖 Тема: {data['lesson_title']}\n"
-        f"📝 Разделы:\n" + "\n".join([f"  - {s}" for s in sections]) + "\n\n"
+        f"✅ **Урок сохранен в БД!**\n\n"
+        f"Вот как он будет выглядеть на сайте:\n"
+        f"```\n{formatted_template}\n```\n\n"
         f"🆔 **ID урока: `{lesson_id}`**\n\n"
         f"👇 Теперь перейди на сайт-загрузчик и загрузи аудио для этого ID."
     )
