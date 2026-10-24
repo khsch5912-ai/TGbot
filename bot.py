@@ -12,6 +12,7 @@ from database import get_or_create_book, save_lesson, delete_lesson, save_video
 class LessonForm(StatesGroup):
     book_title = State()
     author = State()
+    book_slug = State()
     lesson_number = State()
     lesson_title = State()
     sections = State()
@@ -22,7 +23,6 @@ class VideoForm(StatesGroup):
 
 router = Router()
 
-# === СТАРТ ===
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -66,10 +66,10 @@ async def cmd_new(message: Message):
         [InlineKeyboardButton(text="🎬 Видеоурок", callback_data="new_video")]
     ]))
 
-# === ДОБАВЛЕНИЕ АУДИО ===
+# --- АУДИО ---
 @router.callback_query(F.data == "new_audio")
 async def start_new_audio(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🎧 **Шаг 1:** Введи название книги:")
+    await callback.message.edit_text("🎧 **Шаг 1:** Введи название книги (полное):")
     await state.set_state(LessonForm.book_title)
 
 @router.message(LessonForm.book_title)
@@ -81,10 +81,25 @@ async def process_book_title(message: Message, state: FSMContext):
 @router.message(LessonForm.author)
 async def process_author(message: Message, state: FSMContext):
     author = message.text.strip()
+    await state.update_data(author=author)
+    await message.answer(
+        "**Шаг 3:** Придумай короткий код для ссылки (только латиница, цифры и дефис).\n"
+        "Например: `dalil-at-talib` или `bukhari-sahih`:"
+    )
+    await state.set_state(LessonForm.book_slug)
+
+@router.message(LessonForm.book_slug)
+async def process_book_slug(message: Message, state: FSMContext):
+    slug = message.text.strip().lower()
+    if not re.match(r'^[a-z0-9-]+$', slug):
+        await message.answer("❌ Только английские буквы, цифры и дефис. Попробуй еще раз:")
+        return
+        
     data = await state.get_data()
-    book_id = get_or_create_book(data["book_title"], author)
-    await state.update_data(book_id=book_id, author=author)
-    await message.answer("**Шаг 3:** Введи номер урока (можно 2️⃣0️⃣):")
+    book_id = get_or_create_book(data["book_title"], data["author"], slug)
+    
+    await state.update_data(book_id=book_id, slug=slug)
+    await message.answer("**Шаг 4:** Введи номер урока (можно 2️⃣0️⃣):")
     await state.set_state(LessonForm.lesson_number)
 
 @router.message(LessonForm.lesson_number)
@@ -94,13 +109,13 @@ async def process_lesson_number(message: Message, state: FSMContext):
         await message.answer("❌ Не понял номер. Введи число:")
         return
     await state.update_data(lesson_number=int(text))
-    await message.answer("**Шаг 4:** Введи название темы:")
+    await message.answer("**Шаг 5:** Введи название темы:")
     await state.set_state(LessonForm.lesson_title)
 
 @router.message(LessonForm.lesson_title)
 async def process_lesson_title(message: Message, state: FSMContext):
     await state.update_data(lesson_title=message.text.strip())
-    await message.answer("**Шаг 5:** Перечисли подразделы (каждый с новой строки):")
+    await message.answer("**Шаг 6:** Перечисли подразделы (каждый с новой строки):")
     await state.set_state(LessonForm.sections)
 
 @router.message(LessonForm.sections)
@@ -114,10 +129,21 @@ async def process_sections(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка БД: {e}")
         await state.clear()
         return
-    await message.answer(f"✅ **Урок создан!**\nID: `{lesson_id}`\nЗайди на `/admin` сайта, чтобы загрузить аудио.", parse_mode=ParseMode.MARKDOWN)
+    
+    admin_url = settings.admin_site_url
+    lesson_url = f"https://твой-сайт.onrender.com/book/{data['slug']}"
+    
+    await message.answer(
+        f"✅ **Урок создан!**\nID: `{lesson_id}`\n\n"
+        f"👇 Загрузи аудио для этого урока здесь:\n"
+        f"[Перейти в админку]({admin_url})\n\n"
+        f"🔗 **Ссылка на книгу:**\n{lesson_url}",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
     await state.clear()
 
-# === ДОБАВЛЕНИЕ ВИДЕО ===
+# --- ВИДЕО ---
 @router.callback_query(F.data == "new_video")
 async def start_new_video(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("🎬 **Шаг 1:** Введи название видео:")
@@ -145,12 +171,12 @@ async def process_video_url(message: Message, state: FSMContext):
     await message.answer(f"✅ **Видеоурок сохранен!**", parse_mode=ParseMode.MARKDOWN)
     await state.clear()
 
-# === ВСЕ КОНТЕНТ ===
+# --- ALL ---
 @router.message(Command("all"))
 async def cmd_all(message: Message):
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
-    c.execute("SELECT b.title, b.author, l.id, l.lesson_number, l.lesson_title, l.audio_url FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number")
+    c.execute("SELECT b.title, b.slug, l.id, l.lesson_number, l.lesson_title, l.audio_url FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number")
     lessons = c.fetchall()
     c.execute("SELECT id, title, video_url FROM videos ORDER BY id DESC")
     videos = c.fetchall()
@@ -163,7 +189,7 @@ async def cmd_all(message: Message):
         current_book = ""
         for l in lessons:
             if l[0] != current_book:
-                text += f"\n📕 **{l[0]}** ({l[1]})\n"
+                text += f"\n📕 **{l[0]}** (Код: `{l[1]}`)\n"
                 current_book = l[0]
             status = "✅" if l[5] else "⏳"
             text += f"  • [ID: {l[2]}] Урок {l[3]}: {l[4]} {status}\n"
@@ -176,7 +202,6 @@ async def cmd_all(message: Message):
             text += f"  • [ID: {v[0]}] [{v[1]}]({v[2]})\n"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-# === УДАЛЕНИЕ ===
 @router.message(Command("delete"))
 async def cmd_delete(message: Message):
     args = message.text.split()
