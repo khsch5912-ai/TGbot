@@ -5,7 +5,7 @@ import threading
 import requests
 import sqlite3
 import json
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, jsonify
 from config import settings
 from database import init_db, update_audio_url
 from bot import router
@@ -15,7 +15,6 @@ from aiogram.types import BotCommand
 
 app = Flask(__name__)
 
-# --- Логика GitHub ---
 def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     headers = {"Authorization": f"token {settings.github_token}", "Accept": "application/vnd.github.v3+json"}
     tag = filename.rsplit(".", 1)[0].replace(" ", "_")
@@ -35,7 +34,65 @@ def send_telegram_notification(chat_id, text):
     url = f"https://api.telegram.org/bot{settings.bot_token}/sendMessage"
     requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
 
-# --- HTML: САЙТ ДЛЯ КЛИЕНТОВ ---
+# --- API ДЛЯ ВСЕХ УРОКОВ ---
+@app.route('/api/lessons.json')
+def api_lessons_json():
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT b.title as book_title, b.author, b.slug as book_slug, l.id, l.lesson_number, l.lesson_title, l.sections, l.audio_url 
+        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number
+    """)
+    lessons = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT id, title, video_url FROM videos ORDER BY id DESC")
+    videos = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    data = {"books": {}, "videos": videos}
+    for l in lessons:
+        book = l["book_title"]
+        if book not in data["books"]:
+            data["books"][book] = {"author": l["author"], "slug": l["book_slug"], "lessons": []}
+        try: sections = json.loads(l["sections"])
+        except: sections = []
+        data["books"][book]["lessons"].append({
+            "id": l["id"], "number": l["lesson_number"], "title": l["lesson_title"],
+            "sections": sections, "audio_url": l["audio_url"]
+        })
+    return jsonify(data)
+
+# --- API ДЛЯ КОНКРЕТНОЙ КНИГИ ---
+@app.route('/api/book/<slug>.json')
+def api_book_json(slug):
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    c.execute("SELECT id, title, author FROM books WHERE slug = ?", (slug,))
+    book = c.fetchone()
+    if not book:
+        conn.close()
+        return jsonify({"error": "Book not found"}), 404
+
+    c.execute("""
+        SELECT id, lesson_number, lesson_title, sections, audio_url 
+        FROM lessons WHERE book_id = ? ORDER BY lesson_number
+    """, (book["id"],))
+    lessons = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    for l in lessons:
+        try: l["sections"] = json.loads(l["sections"])
+        except: l["sections"] = []
+
+    return jsonify({
+        "title": book["title"],
+        "author": book["author"],
+        "slug": slug,
+        "lessons": lessons
+    })
+
 CLIENT_HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -45,68 +102,120 @@ CLIENT_HTML = """
     <title>Библиотека уроков</title>
     <style>
         body { font-family: system-ui, sans-serif; background: #12121a; color: #e8e8f0; margin: 0; padding: 20px; }
-        h1 { text-align: center; color: #7c3aed; }
+        h1, h2 { text-align: center; color: #7c3aed; }
         .container { max-width: 800px; margin: 0 auto; }
         .book-title { font-size: 24px; color: #f59e0b; margin-top: 30px; border-bottom: 1px solid #2a2a3d; padding-bottom: 10px; }
         .lesson { background: #1a1a26; border-radius: 10px; padding: 15px; margin: 15px 0; }
         .lesson h3 { margin: 0 0 10px 0; color: #7c3aed; }
         .sections { font-size: 14px; color: #8a8aa0; margin-bottom: 15px; }
-        .audio-wrap { display: flex; flex-direction: column; gap: 10px; }
-        audio { width: 100%; border-radius: 5px; }
+        audio { width: 100%; border-radius: 5px; margin-top: 10px; }
         .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; margin-top: 20px; }
         .video-card { background: #1a1a26; padding: 15px; border-radius: 10px; }
         .video-card iframe { width: 100%; aspect-ratio: 16/9; border: none; border-radius: 8px; }
         .video-card h4 { margin: 10px 0 0 0; font-size: 16px; }
+        .loader { text-align: center; margin-top: 50px; font-size: 20px; color: #7c3aed; }
+        a { color: #7c3aed; text-decoration: none; }
+        a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="container" id="app">
         <h1>📚 Библиотека</h1>
-
-        {% if not lessons and not videos %}
-            <p style="text-align:center; opacity:0.5;">Пока пусто. Добавь контент через Telegram-бота.</p>
-        {% endif %}
-
-        {% for book, items in lessons.items() %}
-            <div class="book-title">📕 {{ book }} <span style="font-size:14px; color:#8a8aa0;">({{ items[0].author }})</span></div>
-            {% for l in items %}
-                <div class="lesson">
-                    <h3>Урок {{ l.lesson_number }}: {{ l.lesson_title }}</h3>
-                    <div class="sections">
-                        {% for s in l.sections_list %}
-                            • {{ s }}<br>
-                        {% endfor %}
-                    </div>
-                    {% if l.audio_url %}
-                        <audio controls src="{{ l.audio_url }}"></audio>
-                    {% else %}
-                        <div style="color: #f59e0b; font-size: 14px;">⏳ Аудио еще не загружено</div>
-                    {% endif %}
-                </div>
-            {% endfor %}
-        {% endfor %}
-
-        {% if videos %}
-            <div class="book-title">🎬 Видеоуроки</div>
-            <div class="video-grid">
-                {% for v in videos %}
-                    <div class="video-card">
-                        {% if 'youtube.com' in v.video_url or 'youtu.be' in v.video_url %}
-                            <iframe src="{{ v.video_url.replace('watch?v=', 'embed/').replace('youtu.be/', 'youtube.com/embed/') }}" allowfullscreen></iframe>
-                        {% else %}
-                            <a href="{{ v.video_url }}" target="_blank" style="color: #7c3aed;">Открыть ссылку на видео</a>
-                        {% endif %}
-                        <h4>{{ v.title }}</h4>
-                    </div>
-                {% endfor %}
-            </div>
-        {% endif %}
+        <div id="content"><div class="loader">Загрузка...</div></div>
     </div>
+
+    <script>
+        const path = window.location.pathname;
+        const parts = path.split('/').filter(p => p);
+
+        async function loadData() {
+            if (parts.length === 2 && parts[0] === 'book') {
+                const slug = parts[1];
+                const res = await fetch(`/api/book/${slug}.json`);
+                if (!res.ok) {
+                    document.getElementById('content').innerHTML = `<h2>Книга не найдена :(</h2>`;
+                    return;
+                }
+                const data = await res.json();
+                renderSingleBook(data);
+            } else {
+                const res = await fetch('/api/lessons.json');
+                const data = await res.json();
+                renderAll(data);
+            }
+        }
+
+        function renderSingleBook(bookData) {
+            // СОРТИРОВКА ПО НОМЕРУ УРОКА
+            bookData.lessons.sort((a, b) => a.number - b.number);
+
+            let html = `<a href="/">← Назад ко всем книгам</a>`;
+            html += `<h2>📕 ${bookData.title} <span style="font-size:16px; color:#8a8aa0;">(${bookData.author})</span></h2>`;
+            
+            bookData.lessons.forEach(lesson => {
+                html += `<div class="lesson">
+                    <h3>Урок ${lesson.number}: ${lesson.title}</h3>
+                    <div class="sections">${lesson.sections.map(s => `• ${s}<br>`).join('')}</div>`;
+                if (lesson.audio_url) {
+                    html += `<audio controls src="${lesson.audio_url}"></audio>`;
+                } else {
+                    html += `<div style="color: #f59e0b; font-size: 14px;">⏳ Аудио еще не загружено</div>`;
+                }
+                html += `</div>`;
+            });
+            document.getElementById('content').innerHTML = html;
+        }
+
+        function renderAll(data) {
+            let html = '';
+
+            for (const [bookTitle, bookData] of Object.entries(data.books)) {
+                // СОРТИРОВКА ПО НОМЕРУ УРОКА
+                bookData.lessons.sort((a, b) => a.number - b.number);
+
+                html += `<div class="book-title">
+                    📕 <a href="/book/${bookData.slug}">${bookTitle}</a> 
+                    <span style="font-size:14px; color:#8a8aa0;">(${bookData.author})</span>
+                </div>`;
+                
+                bookData.lessons.forEach(lesson => {
+                    html += `<div class="lesson">
+                        <h3>Урок ${lesson.number}: ${lesson.title}</h3>
+                        <div class="sections">${lesson.sections.map(s => `• ${s}<br>`).join('')}</div>`;
+                    if (lesson.audio_url) {
+                        html += `<audio controls src="${lesson.audio_url}"></audio>`;
+                    } else {
+                        html += `<div style="color: #f59e0b; font-size: 14px;">⏳ Аудио еще не загружено</div>`;
+                    }
+                    html += `</div>`;
+                });
+            }
+
+            if (data.videos && data.videos.length > 0) {
+                html += `<div class="book-title">🎬 Видеоуроки</div><div class="video-grid">`;
+                data.videos.forEach(video => {
+                    let embedUrl = video.video_url;
+                    if (video.video_url.includes('youtube.com/watch?v=')) embedUrl = video.video_url.replace('watch?v=', 'embed/');
+                    else if (video.video_url.includes('youtu.be/')) embedUrl = video.video_url.replace('youtu.be/', 'youtube.com/embed/');
+                    html += `<div class="video-card"><iframe src="${embedUrl}" allowfullscreen></iframe><h4>${video.title}</h4></div>`;
+                });
+                html += `</div>`;
+            }
+
+            document.getElementById('content').innerHTML = html || '<p>Пока пусто.</p>';
+        }
+
+        loadData();
+    </script>
 </body>
 </html>
 """
 
-# --- HTML: АДМИНКА (ЗАГРУЗКА) ---
+@app.route('/')
+@app.route('/book/<slug>')
+def index(slug=None):
+    return render_template_string(CLIENT_HTML)
+
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -138,46 +247,6 @@ ADMIN_HTML = """
 </html>
 """
 
-@app.route('/')
-def index():
-    conn = sqlite3.connect(settings.db_path)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    # Получаем уроки и группируем по книгам
-    c.execute("""
-        SELECT b.title as book, b.author, l.lesson_number, l.lesson_title, l.sections, l.audio_url 
-        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number
-    """)
-    rows = c.fetchall()
-    
-    lessons_dict = {}
-    for r in rows:
-        book = r["book"]
-        if book not in lessons_dict:
-            lessons_dict[book] = []
-        
-        # Парсим JSON разделов
-        try:
-            sections = json.loads(r["sections"])
-        except:
-            sections = []
-            
-        lessons_dict[book].append({
-            "author": r["author"],
-            "lesson_number": r["lesson_number"],
-            "lesson_title": r["lesson_title"],
-            "sections_list": sections,
-            "audio_url": r["audio_url"]
-        })
-        
-    # Получаем видео
-    c.execute("SELECT title, video_url FROM videos ORDER BY id DESC")
-    videos = [dict(v) for v in c.fetchall()]
-    conn.close()
-
-    return render_template_string(CLIENT_HTML, lessons=lessons_dict, videos=videos)
-
 @app.route('/admin', methods=['GET', 'POST'])
 def admin():
     message = ""
@@ -205,7 +274,6 @@ def admin():
             
     return render_template_string(ADMIN_HTML, message=message)
 
-# --- Запуск Бота ---
 async def start_bot():
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
