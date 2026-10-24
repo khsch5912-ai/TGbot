@@ -10,6 +10,12 @@ from config import settings
 from database import init_db, update_audio_url
 from bot import router
 
+from flask import Flask, request, render_template, jsonify
+from flask_cors import CORS  # <--- ДОБАВИТЬ ЭТО
+
+app = Flask(__name__)
+CORS(app)  # <--- ДОБАВИТЬ ЭТО (разрешает запросы с любых доменов)
+
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 
