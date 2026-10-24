@@ -6,15 +6,16 @@ from config import settings
 def init_db():
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
-    # Книги
+    
     c.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT UNIQUE,
-            author TEXT
+            author TEXT,
+            slug TEXT UNIQUE
         )
     """)
-    # Уроки (аудио)
+    
     c.execute("""
         CREATE TABLE IF NOT EXISTS lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +30,7 @@ def init_db():
             FOREIGN KEY(book_id) REFERENCES books(id)
         )
     """)
-    # Видео
+    
     c.execute("""
         CREATE TABLE IF NOT EXISTS videos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,16 +44,16 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_or_create_book(title: str, author: str) -> int:
+def get_or_create_book(title: str, author: str, slug: str) -> int:
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
-    c.execute("SELECT id FROM books WHERE title = ?", (title,))
+    c.execute("SELECT id FROM books WHERE slug = ?", (slug,))
     row = c.fetchone()
     if row:
         book_id = row[0]
-        c.execute("UPDATE books SET author = ? WHERE id = ?", (author, book_id))
+        c.execute("UPDATE books SET title = ?, author = ? WHERE id = ?", (title, author, book_id))
     else:
-        c.execute("INSERT INTO books (title, author) VALUES (?, ?)", (title, author))
+        c.execute("INSERT INTO books (title, author, slug) VALUES (?, ?, ?)", (title, author, slug))
         book_id = c.lastrowid
     conn.commit()
     conn.close()
