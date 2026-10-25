@@ -9,7 +9,6 @@ class Settings(BaseSettings):
     github_repo: str = Field(..., alias="GITHUB_REPO")
     db_path: str = Field("books.db", alias="DB_PATH")
     admin_ids_raw: str = Field("", alias="ADMIN_IDS")
-    admin_site_url: str = Field("", alias="ADMIN_SITE_URL")
 
     @property
     def admin_ids(self) -> list[int]:
