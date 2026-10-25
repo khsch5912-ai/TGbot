@@ -1,25 +1,49 @@
 import re
-import sqlite3
-from aiogram import F, Router
+import io
+import requests
+from aiogram import F, Router, Bot
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from config import settings
-from database import get_or_create_book, save_lesson, delete_lesson, save_video
+from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
-class LessonForm(StatesGroup):
-    book_title = State()
-    author = State()
-    book_slug = State()
-    lesson_number = State()
-    lesson_title = State()
-    sections = State()
-    
-class VideoForm(StatesGroup):
-    title = State()
-    url = State()
+# Настройка локального API (снимает лимит 20 МБ)
+LOCAL_API_URL = "http://telegram-api-server:8081" 
+session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API_URL))
+
+def make_slug(title: str) -> str:
+    eng_words = re.findall(r'[a-zA-Z0-9]+', title)
+    if eng_words:
+        return "-".join(eng_words).lower()
+    return f"book-{abs(hash(title)) % 10000}"
+
+def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
+    headers = {"Authorization": f"token {settings.github_token}", "Accept": "application/vnd.github.v3+json"}
+    tag = filename.rsplit(".", 1)[0].replace(" ", "_")
+    payload = {"tag_name": tag, "name": f"Файл {tag}", "body": "Загружено", "draft": False, "prerelease": False}
+    resp = requests.post(f"https://api.github.com/repos/{settings.github_repo}/releases", json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    upload_url = resp.json()["upload_url"].split("{")[0]
+    upload_headers = headers.copy()
+    upload_headers["Content-Type"] = "application/octet-stream"
+    file_bytes.seek(0)
+    upload_resp = requests.post(f"{upload_url}?name={filename}", headers=upload_headers, data=file_bytes.getvalue(), timeout=300)
+    upload_resp.raise_for_status()
+    return upload_resp.json()["browser_download_url"]
+
+# --- СОСТОЯНИЯ (по блок-схеме) ---
+class NewBookForm(StatesGroup):
+    audio = State()
+    title_author = State()
+    details = State()
+
+class ExistingBookForm(StatesGroup):
+    audio = State()
+    details = State()
 
 router = Router()
 
@@ -27,192 +51,99 @@ router = Router()
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить контент", callback_data="menu_new")],
-        [InlineKeyboardButton(text="📚 Посмотреть всё", callback_data="menu_all")]
+        [InlineKeyboardButton(text="1. Записать новую книгу", callback_data="flow_new")],
+        [InlineKeyboardButton(text="2. Продолжить существующую", callback_data="flow_existing")]
     ])
-    text = (
-        "👋 **Привет! Я бот управления библиотекой.**\n\n"
-        "🔹 `/new` — добавить аудио или видео.\n"
-        "🔹 `/all` — посмотреть всё, что есть.\n"
-        "🔹 `/delete ID` — удалить урок.\n\n"
-        "Выбери действие:"
-    )
-    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    await message.answer("Выбери действие:\n1. Записать новую книгу\n2. Продолжить существующую", reply_markup=kb)
 
-@router.callback_query(F.data == "menu_new")
-async def menu_new(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "Что добавим?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎧 Аудиоурок", callback_data="new_audio")],
-            [InlineKeyboardButton(text="🎬 Видеоурок", callback_data="new_video")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
-        ])
-    )
+# ==========================================
+# ВЕТКА 1: НОВАЯ КНИГА
+# ==========================================
+@router.callback_query(F.data == "flow_new")
+async def new_book_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Создание нового цикла записей.\n\nЭтап 1. Отправь мне аудиофайл.")
+    await state.set_state(NewBookForm.audio)
 
-@router.callback_query(F.data == "menu_back")
-async def menu_back(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить контент", callback_data="menu_new")],
-        [InlineKeyboardButton(text="📚 Посмотреть всё", callback_data="menu_all")]
-    ])
-    await callback.message.edit_text("Главное меню:", reply_markup=kb)
-
-@router.message(Command("new"))
-async def cmd_new(message: Message):
-    await message.answer("Что добавим?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎧 Аудиоурок", callback_data="new_audio")],
-        [InlineKeyboardButton(text="🎬 Видеоурок", callback_data="new_video")]
-    ]))
-
-# --- АУДИО ---
-@router.callback_query(F.data == "new_audio")
-async def start_new_audio(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🎧 **Шаг 1:** Введи название книги (полное):")
-    await state.set_state(LessonForm.book_title)
-
-@router.message(LessonForm.book_title)
-async def process_book_title(message: Message, state: FSMContext):
-    await state.update_data(book_title=message.text.strip())
-    await message.answer("**Шаг 2:** Введи автора книги:")
-    await state.set_state(LessonForm.author)
-
-@router.message(LessonForm.author)
-async def process_author(message: Message, state: FSMContext):
-    author = message.text.strip()
-    await state.update_data(author=author)
-    await message.answer(
-        "**Шаг 3:** Придумай короткий код для ссылки (только латиница, цифры и дефис).\n"
-        "Например: `dalil-at-talib` или `bukhari-sahih`:"
-    )
-    await state.set_state(LessonForm.book_slug)
-
-@router.message(LessonForm.book_slug)
-async def process_book_slug(message: Message, state: FSMContext):
-    slug = message.text.strip().lower()
-    if not re.match(r'^[a-z0-9-]+$', slug):
-        await message.answer("❌ Только английские буквы, цифры и дефис. Попробуй еще раз:")
-        return
-        
-    data = await state.get_data()
-    book_id = get_or_create_book(data["book_title"], data["author"], slug)
+@router.message(NewBookForm.audio, F.voice | F.audio | F.document)
+async def new_book_audio(message: Message, state: FSMContext):
+    if message.voice: file_id, ext = message.voice.file_id, "ogg"
+    elif message.audio: file_id, ext = message.audio.file_id, "mp3"
+    else: file_id, ext = message.document.file_id, "mp3"
     
-    await state.update_data(book_id=book_id, slug=slug)
-    await message.answer("**Шаг 4:** Введи номер урока (можно 2️⃣0️⃣):")
-    await state.set_state(LessonForm.lesson_number)
+    await state.update_data(audio_file_id=file_id, ext=ext)
+    await message.answer("Этап 2. Аудио получено!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+    await state.set_state(NewBookForm.title_author)
 
-@router.message(LessonForm.lesson_number)
-async def process_lesson_number(message: Message, state: FSMContext):
-    text = re.sub(r'[^\d]', '', message.text.strip())
-    if not text:
-        await message.answer("❌ Не понял номер. Введи число:")
+@router.message(NewBookForm.title_author)
+async def new_book_title(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if "," not in text:
+        await message.answer("Пожалуйста, укажи название и автора через запятую.")
         return
-    await state.update_data(lesson_number=int(text))
-    await message.answer("**Шаг 5:** Введи название темы:")
-    await state.set_state(LessonForm.lesson_title)
+    title, author = [x.strip() for x in text.split(",", 1)]
+    await state.update_data(title=title, author=author)
+    await message.answer("Этап 3. Отлично!\nТеперь напиши:\n1) Часть\n2) О чем запись\n(каждый пункт с новой строки)")
+    await state.set_state(NewBookForm.details)
 
-@router.message(LessonForm.lesson_title)
-async def process_lesson_title(message: Message, state: FSMContext):
-    await state.update_data(lesson_title=message.text.strip())
-    await message.answer("**Шаг 6:** Перечисли подразделы (каждый с новой строки):")
-    await state.set_state(LessonForm.sections)
-
-@router.message(LessonForm.sections)
-async def process_sections(message: Message, state: FSMContext):
-    sections = [s.strip() for s in message.text.strip().split('\n') if s.strip()]
+@router.message(NewBookForm.details)
+async def new_book_details(message: Message, state: FSMContext, bot: Bot):
+    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
+    part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
+    description = lines[1] if len(lines) > 1 else "Без описания"
     data = await state.get_data()
-    data.update({"sections": sections, "uploaded_by": message.from_user.id, "uploaded_by_name": message.from_user.full_name})
+    
+    slug = make_slug(data["title"])
+    book_id = get_or_create_book(data["title"], data["author"], slug)
+    lesson_data = {"book_id": book_id, "lesson_number": part, "part": part, "description": description}
+    lesson_id = save_lesson(lesson_data)
+    
+    await message.answer("⏳ Загружаю аудио на хостинг...")
+    await process_and_upload_audio(message, bot, data["audio_file_id"], data["ext"], lesson_id)
+    await state.clear()
+
+# ==========================================
+# ВЕТКА 2: ПРОДОЛЖИТЬ СУЩЕСТВУЮЩУЮ
+# ==========================================
+@router.callback_query(F.data == "flow_existing")
+async def existing_book_start(callback: CallbackQuery, state: FSMContext):
+    last_book = get_last_book()
+    if not last_book:
+        await callback.message.edit_text("В базе нет ни одной книги. Сначала создай новую.")
+        return
+    await state.update_data(book_id=last_book["id"], title=last_book["title"])
+    await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nЗагружаем аудио. Отправь мне файл.")
+    await state.set_state(ExistingBookForm.audio)
+
+@router.message(ExistingBookForm.audio, F.voice | F.audio | F.document)
+async def existing_book_audio(message: Message, state: FSMContext):
+    if message.voice: file_id, ext = message.voice.file_id, "ogg"
+    elif message.audio: file_id, ext = message.audio.file_id, "mp3"
+    else: file_id, ext = message.document.file_id, "mp3"
+    
+    await state.update_data(audio_file_id=file_id, ext=ext)
+    await message.answer("Аудио получено! Теперь напиши:\n1) Часть\n2) О чем запись\n(каждый пункт с новой строки)")
+    await state.set_state(ExistingBookForm.details)
+
+@router.message(ExistingBookForm.details)
+async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
+    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
+    part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
+    description = lines[1] if len(lines) > 1 else "Без описания"
+    data = await state.get_data()
+    
+    lesson_data = {"book_id": data["book_id"], "lesson_number": part, "part": part, "description": description}
+    lesson_id = save_lesson(lesson_data)
+    
+    await message.answer("⏳ Загружаю аудио на хостинг...")
+    await process_and_upload_audio(message, bot, data["audio_file_id"], data["ext"], lesson_id)
+    await state.clear()
+
+async def process_and_upload_audio(message: Message, bot: Bot, file_id: str, ext: str, lesson_id: int):
     try:
-        lesson_id = save_lesson(data)
+        file_obj = await bot.download(file_id)
+        filename = f"lesson_{lesson_id}.{ext}"
+        audio_url = github_upload_audio(file_obj, filename)
+        update_audio_url(lesson_id, audio_url)
+        await message.answer(f"✅ Готово! Запись успешно загружена и появилась на сайте.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка БД: {e}")
-        await state.clear()
-        return
-    
-    admin_url = settings.admin_site_url
-    lesson_url = f"https://твой-сайт.onrender.com/book/{data['slug']}"
-    
-    await message.answer(
-        f"✅ **Урок создан!**\nID: `{lesson_id}`\n\n"
-        f"👇 Загрузи аудио для этого урока здесь:\n"
-        f"[Перейти в админку]({admin_url})\n\n"
-        f"🔗 **Ссылка на книгу:**\n{lesson_url}",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True
-    )
-    await state.clear()
-
-# --- ВИДЕО ---
-@router.callback_query(F.data == "new_video")
-async def start_new_video(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🎬 **Шаг 1:** Введи название видео:")
-    await state.set_state(VideoForm.title)
-
-@router.message(VideoForm.title)
-async def process_video_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text.strip())
-    await message.answer("**Шаг 2:** Отправь ссылку на видео (YouTube):")
-    await state.set_state(VideoForm.url)
-
-@router.message(VideoForm.url)
-async def process_video_url(message: Message, state: FSMContext):
-    url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("❌ Это не ссылка. Отправь ссылку (http...):")
-        return
-    data = await state.get_data()
-    try:
-        save_video(title=data["title"], url=url, user_id=message.from_user.id, user_name=message.from_user.full_name)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка БД: {e}")
-        await state.clear()
-        return
-    await message.answer(f"✅ **Видеоурок сохранен!**", parse_mode=ParseMode.MARKDOWN)
-    await state.clear()
-
-# --- ALL ---
-@router.message(Command("all"))
-async def cmd_all(message: Message):
-    conn = sqlite3.connect(settings.db_path)
-    c = conn.cursor()
-    c.execute("SELECT b.title, b.slug, l.id, l.lesson_number, l.lesson_title, l.audio_url FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.lesson_number")
-    lessons = c.fetchall()
-    c.execute("SELECT id, title, video_url FROM videos ORDER BY id DESC")
-    videos = c.fetchall()
-    conn.close()
-
-    text = "📚 **Твоя библиотека:**\n\n🎧 **Аудиоуроки:**\n"
-    if not lessons:
-        text += "_Нет уроков._\n"
-    else:
-        current_book = ""
-        for l in lessons:
-            if l[0] != current_book:
-                text += f"\n📕 **{l[0]}** (Код: `{l[1]}`)\n"
-                current_book = l[0]
-            status = "✅" if l[5] else "⏳"
-            text += f"  • [ID: {l[2]}] Урок {l[3]}: {l[4]} {status}\n"
-
-    text += "\n🎬 **Видеоуроки:**\n"
-    if not videos:
-        text += "_Нет видео._\n"
-    else:
-        for v in videos:
-            text += f"  • [ID: {v[0]}] [{v[1]}]({v[2]})\n"
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-@router.message(Command("delete"))
-async def cmd_delete(message: Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Используй: `/delete ID`")
-        return
-    try:
-        lesson_id = int(args[1])
-        if delete_lesson(lesson_id):
-            await message.answer(f"🗑 Урок {lesson_id} удален.")
-        else:
-            await message.answer(f"⚠️ Урок {lesson_id} не найден.")
-    except ValueError:
-        await message.answer("ID должен быть числом.")
+        await message.answer(f"❌ Ошибка при загрузке на GitHub: {e}")
