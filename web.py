@@ -9,8 +9,6 @@ from database import init_db
 from bot import router
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
 
 app = Flask(__name__)
 CORS(app)
@@ -34,14 +32,29 @@ def api_lessons_json():
         data["books"][book]["lessons"].append({"id": l["id"], "part": l["part"], "description": l["description"], "audio_url": l["audio_url"]})
     return jsonify(data)
 
+@app.route('/api/book/<slug>.json')
+def api_book_json(slug):
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, title, author FROM books WHERE slug = ?", (slug,))
+    book = c.fetchone()
+    if not book:
+        conn.close()
+        return jsonify({"error": "Book not found"}), 404
+
+    c.execute("SELECT id, part, description, audio_url FROM lessons WHERE book_id = ? ORDER BY part", (book["id"],))
+    lessons = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    return jsonify({"title": book["title"], "author": book["author"], "slug": slug, "lessons": lessons})
+
 @app.route('/')
 def index():
     return "API is running. Go to /api/lessons.json"
 
 async def start_bot():
-    LOCAL_API_URL = "https://telegram-bot-api-latest-0qr5.onrender.com" # <-- ТВОЙ URL
-    session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API_URL))
-    bot = Bot(token=settings.bot_token, session=session)
+    bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен...")
