@@ -1,5 +1,6 @@
 import re
 import io
+import os
 import requests
 from aiogram import F, Router, Bot
 from aiogram.filters import Command
@@ -11,7 +12,9 @@ from aiogram.client.telegram import TelegramAPIServer
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
-LOCAL_API_URL = "https://telegram-bot-api-latest-0qr5.onrender.com" # <-- ТВОЙ URL
+# ВСТАВЬ СЮДА СВОЙ ПУБЛИЧНЫЙ URL API-СЕРВЕРА (тот, что заканчивается на .onrender.com)
+LOCAL_API_URL = "https://telegram-bot-api-latest-0qr5.onrender.com" 
+
 session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API_URL))
 
 def make_slug(title: str) -> str:
@@ -33,6 +36,7 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     upload_resp.raise_for_status()
     return upload_resp.json()["browser_download_url"]
 
+# --- СОСТОЯНИЯ ---
 class NewBookForm(StatesGroup):
     audio = State()
     title_author = State()
@@ -53,6 +57,9 @@ async def cmd_start(message: Message, state: FSMContext):
     ])
     await message.answer("Выбери действие:\n1. Записать новую книгу\n2. Продолжить существующую", reply_markup=kb)
 
+# ==========================================
+# ВЕТКА 1: НОВАЯ КНИГА
+# ==========================================
 @router.callback_query(F.data == "flow_new")
 async def new_book_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Создание нового цикла записей.\n\nЭтап 1. Отправь мне аудиофайл.")
@@ -63,6 +70,7 @@ async def new_book_audio(message: Message, state: FSMContext):
     if message.voice: file_id, ext = message.voice.file_id, "ogg"
     elif message.audio: file_id, ext = message.audio.file_id, "mp3"
     else: file_id, ext = message.document.file_id, "mp3"
+    
     await state.update_data(audio_file_id=file_id, ext=ext)
     await message.answer("Этап 2. Аудио получено!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
     await state.set_state(NewBookForm.title_author)
@@ -84,13 +92,19 @@ async def new_book_details(message: Message, state: FSMContext, bot: Bot):
     part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
     description = lines[1] if len(lines) > 1 else "Без описания"
     data = await state.get_data()
+    
     slug = make_slug(data["title"])
     book_id = get_or_create_book(data["title"], data["author"], slug)
-    lesson_id = save_lesson({"book_id": book_id, "lesson_number": part, "part": part, "description": description})
+    lesson_data = {"book_id": book_id, "lesson_number": part, "part": part, "description": description}
+    lesson_id = save_lesson(lesson_data)
+    
     await message.answer("⏳ Загружаю аудио на хостинг...")
     await process_and_upload_audio(message, bot, data["audio_file_id"], data["ext"], lesson_id)
     await state.clear()
 
+# ==========================================
+# ВЕТКА 2: ПРОДОЛЖИТЬ СУЩЕСТВУЮЩУЮ
+# ==========================================
 @router.callback_query(F.data == "flow_existing")
 async def existing_book_start(callback: CallbackQuery, state: FSMContext):
     last_book = get_last_book()
@@ -106,6 +120,7 @@ async def existing_book_audio(message: Message, state: FSMContext):
     if message.voice: file_id, ext = message.voice.file_id, "ogg"
     elif message.audio: file_id, ext = message.audio.file_id, "mp3"
     else: file_id, ext = message.document.file_id, "mp3"
+    
     await state.update_data(audio_file_id=file_id, ext=ext)
     await message.answer("Аудио получено! Теперь напиши:\n1) Часть\n2) О чем запись\n(каждый пункт с новой строки)")
     await state.set_state(ExistingBookForm.details)
@@ -116,16 +131,40 @@ async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
     part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
     description = lines[1] if len(lines) > 1 else "Без описания"
     data = await state.get_data()
-    lesson_id = save_lesson({"book_id": data["book_id"], "lesson_number": part, "part": part, "description": description})
+    
+    lesson_data = {"book_id": data["book_id"], "lesson_number": part, "part": part, "description": description}
+    lesson_id = save_lesson(lesson_data)
+    
     await message.answer("⏳ Загружаю аудио на хостинг...")
     await process_and_upload_audio(message, bot, data["audio_file_id"], data["ext"], lesson_id)
     await state.clear()
 
+# ==========================================
+# ФУНКЦИЯ ЗАГРУЗКИ С ОБХОДОМ 404
+# ==========================================
 async def process_and_upload_audio(message: Message, bot: Bot, file_id: str, ext: str, lesson_id: int):
     try:
-        file_obj = await bot.download(file_id)
-        audio_url = github_upload_audio(file_obj, f"lesson_{lesson_id}.{ext}")
+        # 1. Получаем инфу о файле
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        # 2. Локальный или облачный режим?
+        if file_path and file_path.startswith('/'):
+            # Локальный режим (файл на сервере)
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    file_bytes = io.BytesIO(f.read())
+            else:
+                raise Exception("Файл не найден на локальном диске. Убедитесь, что сервисы имеют общий диск.")
+        else:
+            # Облачный режим
+            file_bytes = await bot.download(file_id)
+        
+        # 3. Грузим на GitHub
+        filename = f"lesson_{lesson_id}.{ext}"
+        audio_url = github_upload_audio(file_bytes, filename)
         update_audio_url(lesson_id, audio_url)
+        
         await message.answer("✅ Готово! Запись успешно загружена и появилась на сайте.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при загрузке: {e}")
