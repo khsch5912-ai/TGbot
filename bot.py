@@ -10,17 +10,32 @@ from aiogram.fsm.state import State, StatesGroup
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
-# Импортируем yt-dlp
+# Импорты для скачивания с YouTube
 import yt_dlp
 from contextlib import redirect_stdout
 
-# ... (функция make_slug и github_upload_audio остаются без изменений) ...
+def make_slug(title: str) -> str:
+    eng_words = re.findall(r'[a-zA-Z0-9]+', title)
+    if eng_words: return "-".join(eng_words).lower()
+    return f"book-{abs(hash(title)) % 10000}"
 
-# ==========================================
-# СОСТОЯНИЯ ДЛЯ НОВОЙ ЛОГИКИ (Ссылка вместо файла)
-# ==========================================
+def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
+    headers = {"Authorization": f"token {settings.github_token}", "Accept": "application/vnd.github.v3+json"}
+    tag = filename.rsplit(".", 1)[0].replace(" ", "_")
+    payload = {"tag_name": tag, "name": f"Файл {tag}", "body": "Загружено", "draft": False, "prerelease": False}
+    resp = requests.post(f"https://api.github.com/repos/{settings.github_repo}/releases", json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    upload_url = resp.json()["upload_url"].split("{")[0]
+    upload_headers = headers.copy()
+    upload_headers["Content-Type"] = "application/octet-stream"
+    file_bytes.seek(0)
+    upload_resp = requests.post(f"{upload_url}?name={filename}", headers=upload_headers, data=file_bytes.getvalue(), timeout=300)
+    upload_resp.raise_for_status()
+    return upload_resp.json()["browser_download_url"]
+
+# --- СОСТОЯНИЯ ---
 class NewBookForm(StatesGroup):
-    youtube_url = State()   # Вместо аудио — ссылка
+    youtube_url = State()
     title_author = State()
     details = State()
 
@@ -28,10 +43,20 @@ class ExistingBookForm(StatesGroup):
     youtube_url = State()
     details = State()
 
-# ... (роутер, /start и кнопки без изменений) ...
+# ВОТ ЭТА СТРОКА БЫЛА ПОТЕРЯНА. ОНА СОЗДАЕТ РОУТЕР.
+router = Router()
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1. Записать новую книгу", callback_data="flow_new")],
+        [InlineKeyboardButton(text="2. Продолжить существующую", callback_data="flow_existing")]
+    ])
+    await message.answer("Выбери действие:\n1. Записать новую книгу\n2. Продолжить существующую", reply_markup=kb)
 
 # ==========================================
-# ВЕТКА 1: НОВАЯ КНИГА (Через ссылку)
+# ВЕТКА 1: НОВАЯ КНИГА
 # ==========================================
 @router.callback_query(F.data == "flow_new")
 async def new_book_start(callback: CallbackQuery, state: FSMContext):
@@ -77,7 +102,7 @@ async def new_book_details(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 # ==========================================
-# ВЕТКА 2: ПРОДОЛЖИТЬ (Через ссылку)
+# ВЕТКА 2: ПРОДОЛЖИТЬ СУЩЕСТВУЮЩУЮ
 # ==========================================
 @router.callback_query(F.data == "flow_existing")
 async def existing_book_start(callback: CallbackQuery, state: FSMContext):
@@ -115,18 +140,16 @@ async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 # ==========================================
-# НОВАЯ ФУНКЦИЯ: Скачивание в память и загрузка в GitHub
+# ФУНКЦИЯ СКАЧИВАНИЯ И ЗАГРУЗКИ
 # ==========================================
 async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
     try:
-        # 1. Настраиваем yt-dlp для скачивания аудио в stdout (в память)
-        # Используем redirect_stdout, чтобы перехватить байты
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': '-',  # Вывод в stdout
+            'outtmpl': '-', 
             'quiet': True,
             'no_warnings': True,
-            'logtostderr': True, # Чтобы логи не мешали аудио
+            'logtostderr': True,
         }
 
         buffer = io.BytesIO()
@@ -135,17 +158,12 @@ async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
         with redirect_stdout(buffer), yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # Получаем байты аудио
         audio_bytes = buffer.getvalue()
         
-        # Проверка, что файл скачался
         if len(audio_bytes) < 1000:
             raise Exception("Не удалось скачать аудио (файл слишком мал). Возможно, видео недоступно.")
 
-        # 2. Загружаем на GitHub
-        # Определяем расширение (yt-dlp обычно выдает webm или m4a для аудио)
-        # Для простоты сохраняем как .webm (браузеры его играют) или .mp3 если сконвертируем
-        # Если нужен MP3, потребуется ffmpeg (сложно на Render Free)
+        # Сохраняем как webm (браузеры его играют)
         filename = f"lesson_{lesson_id}.webm" 
         
         audio_url = github_upload_audio(io.BytesIO(audio_bytes), filename)
