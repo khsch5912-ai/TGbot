@@ -1,6 +1,7 @@
 import re
 import io
 import os
+import base64
 import requests
 from aiogram import F, Router, Bot
 from aiogram.filters import Command
@@ -10,9 +11,22 @@ from aiogram.fsm.state import State, StatesGroup
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
-# Импорты для скачивания с YouTube
 import yt_dlp
 from contextlib import redirect_stdout
+
+# ==========================================
+# ЗАГРУЗКА КУКИ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
+# ==========================================
+cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
+if cookies_b64:
+    try:
+        with open("cookies.txt", "wb") as f:
+            f.write(base64.b64decode(cookies_b64))
+        print("Файл cookies.txt успешно создан из переменной окружения.")
+    except Exception as e:
+        print(f"Ошибка при создании cookies.txt: {e}")
+else:
+    print("ВНИМАНИЕ: Переменная YOUTUBE_COOKIES_B64 не найдена. Куки не загружены.")
 
 def make_slug(title: str) -> str:
     eng_words = re.findall(r'[a-zA-Z0-9]+', title)
@@ -43,7 +57,6 @@ class ExistingBookForm(StatesGroup):
     youtube_url = State()
     details = State()
 
-# ВОТ ЭТА СТРОКА БЫЛА ПОТЕРЯНА. ОНА СОЗДАЕТ РОУТЕР.
 router = Router()
 
 @router.message(Command("start"))
@@ -144,14 +157,22 @@ async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
 # ==========================================
 async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
     try:
+        # Настройки yt-dlp
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': '-', 
+            'outtmpl': '-', # Вывод в stdout (в память)
             'quiet': True,
             'no_warnings': True,
             'logtostderr': True,
+            'cookiefile': 'cookies.txt', # Используем куки
         }
 
+        # Чтобы узнать формат файла, сначала запрашиваем инфу
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            # Берем расширение из лучшего аудиоформата (обычно webm или m4a)
+            ext = info.get('ext', 'webm') 
+        
         buffer = io.BytesIO()
         
         # Запускаем скачивание
@@ -163,13 +184,12 @@ async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
         if len(audio_bytes) < 1000:
             raise Exception("Не удалось скачать аудио (файл слишком мал). Возможно, видео недоступно.")
 
-        # Сохраняем как webm (браузеры его играют)
-        filename = f"lesson_{lesson_id}.webm" 
+        filename = f"lesson_{lesson_id}.{ext}"
         
         audio_url = github_upload_audio(io.BytesIO(audio_bytes), filename)
         update_audio_url(lesson_id, audio_url)
         
-        await message.answer("✅ Готово! Аудио скачано с YouTube и загружено на сайт.")
+        await message.answer(f"✅ Готово! Аудио скачано с YouTube и загружено на сайт (формат: {ext}).")
         
     except Exception as e:
         await message.answer(f"❌ Ошибка при скачивании/загрузке: {e}")
