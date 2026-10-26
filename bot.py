@@ -157,39 +157,35 @@ async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
 # ==========================================
 async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
     try:
-        # Настройки yt-dlp
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': '-', # Вывод в stdout (в память)
+            'outtmpl': '-', 
             'quiet': True,
             'no_warnings': True,
             'logtostderr': True,
-            'cookiefile': 'cookies.txt', # Используем куки
+            'cookiefile': 'cookies.txt',
         }
 
-        # Чтобы узнать формат файла, сначала запрашиваем инфу
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            # Берем расширение из лучшего аудиоформата (обычно webm или m4a)
             ext = info.get('ext', 'webm') 
         
         buffer = io.BytesIO()
         
-        # Запускаем скачивание
         with redirect_stdout(buffer), yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
         audio_bytes = buffer.getvalue()
         
         if len(audio_bytes) < 1000:
-            raise Exception("Не удалось скачать аудио (файл слишком мал). Возможно, видео недоступно.")
+            raise Exception("Не удалось скачать аудио (файл слишком мал).")
 
         filename = f"lesson_{lesson_id}.{ext}"
         
         audio_url = github_upload_audio(io.BytesIO(audio_bytes), filename)
         update_audio_url(lesson_id, audio_url)
         
-        await message.answer(f"✅ Готово! Аудио скачано с YouTube и загружено на сайт (формат: {ext}).")
+        await message.answer(f"✅ Готово! Аудио скачано с YouTube и загружено на сайт.")
         
     except Exception as e:
         await message.answer(f"❌ Ошибка при скачивании/загрузке: {e}")
