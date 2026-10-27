@@ -1,7 +1,5 @@
 import re
 import io
-import os
-import base64
 import requests
 from aiogram import F, Router, Bot
 from aiogram.filters import Command
@@ -10,23 +8,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
-
-import yt_dlp
-from contextlib import redirect_stdout
-
-# ==========================================
-# ЗАГРУЗКА КУКИ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
-# ==========================================
-cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
-if cookies_b64:
-    try:
-        with open("cookies.txt", "wb") as f:
-            f.write(base64.b64decode(cookies_b64))
-        print("Файл cookies.txt успешно создан из переменной окружения.")
-    except Exception as e:
-        print(f"Ошибка при создании cookies.txt: {e}")
-else:
-    print("ВНИМАНИЕ: Переменная YOUTUBE_COOKIES_B64 не найдена. Куки не загружены.")
 
 def make_slug(title: str) -> str:
     eng_words = re.findall(r'[a-zA-Z0-9]+', title)
@@ -40,6 +21,7 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     resp = requests.post(f"https://api.github.com/repos/{settings.github_repo}/releases", json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
     upload_url = resp.json()["upload_url"].split("{")[0]
+    
     upload_headers = headers.copy()
     upload_headers["Content-Type"] = "application/octet-stream"
     file_bytes.seek(0)
@@ -49,15 +31,17 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
 
 # --- СОСТОЯНИЯ ---
 class NewBookForm(StatesGroup):
-    youtube_url = State()
+    audio_parts = State()
     title_author = State()
-    details = State()
+    lesson_title = State()
 
 class ExistingBookForm(StatesGroup):
-    youtube_url = State()
-    details = State()
+    audio_parts = State()
+    lesson_title = State()
 
 router = Router()
+# Временное хранилище для частей (в оперативной памяти)
+audio_chunks = {}
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -73,18 +57,42 @@ async def cmd_start(message: Message, state: FSMContext):
 # ==========================================
 @router.callback_query(F.data == "flow_new")
 async def new_book_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Создание нового цикла записей.\n\nЭтап 1. Отправь мне ссылку на видео с YouTube.")
-    await state.set_state(NewBookForm.youtube_url)
+    await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл (или его части по очереди, до 20 МБ каждая).")
+    await state.set_state(NewBookForm.audio_parts)
+    audio_chunks[callback.from_user.id] = []
 
-@router.message(NewBookForm.youtube_url)
-async def new_book_url(message: Message, state: FSMContext):
-    url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("Это не похоже на ссылку. Отправь ссылку с YouTube:")
-        return
+@router.message(NewBookForm.audio_parts, F.voice | F.audio | F.document)
+async def new_book_audio(message: Message, state: FSMContext, bot: Bot):
+    if message.voice: file_id = message.voice.file_id
+    elif message.audio: file_id = message.audio.file_id
+    else: file_id = message.document.file_id
     
-    await state.update_data(youtube_url=url)
-    await message.answer("Этап 2. Ссылка получена!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+    file_obj = await bot.download(file_id)
+    audio_chunks[message.from_user.id].append(file_obj.getvalue())
+    
+    await message.answer(f"Часть {len(audio_chunks[message.from_user.id])} получена! Можешь отправить следующую, или нажми кнопку ниже, если это была последняя часть.")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Завершить загрузку", callback_data="finish_upload")]
+    ])
+    await message.answer("Когда закончишь, нажми кнопку:", reply_markup=kb)
+
+@router.callback_query(F.data == "finish_upload")
+async def finish_upload(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    if user_id not in audio_chunks or not audio_chunks[user_id]:
+        await callback.message.edit_text("Вы не отправили ни одного файла.")
+        return
+
+    final_file = io.BytesIO()
+    for chunk in audio_chunks[user_id]:
+        final_file.write(chunk)
+    final_file.seek(0)
+    
+    await state.update_data(full_audio=final_file.getvalue())
+    audio_chunks[user_id] = []
+    
+    await callback.message.edit_text("Аудио собрано!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
     await state.set_state(NewBookForm.title_author)
 
 @router.message(NewBookForm.title_author)
@@ -95,23 +103,25 @@ async def new_book_title(message: Message, state: FSMContext):
         return
     title, author = [x.strip() for x in text.split(",", 1)]
     await state.update_data(title=title, author=author)
-    await message.answer("Этап 3. Отлично!\nТеперь напиши:\n1) Часть\n2) О чем запись\n(каждый пункт с новой строки)")
-    await state.set_state(NewBookForm.details)
+    await message.answer("Теперь напиши название этого урока (например: Урок 20. Книга намаза):")
+    await state.set_state(NewBookForm.lesson_title)
 
-@router.message(NewBookForm.details)
-async def new_book_details(message: Message, state: FSMContext, bot: Bot):
-    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
-    part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
-    description = lines[1] if len(lines) > 1 else "Без описания"
+@router.message(NewBookForm.lesson_title)
+async def new_book_lesson_title(message: Message, state: FSMContext, bot: Bot):
+    lesson_title = message.text.strip()
     data = await state.get_data()
     
     slug = make_slug(data["title"])
     book_id = get_or_create_book(data["title"], data["author"], slug)
-    lesson_data = {"book_id": book_id, "lesson_number": part, "part": part, "description": description}
-    lesson_id = save_lesson(lesson_data)
+    lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title})
     
-    await message.answer("⏳ Скачиваю аудио с YouTube и загружаю на хостинг...")
-    await process_youtube_to_github(message, data["youtube_url"], lesson_id)
+    await message.answer("⏳ Загружаю склеенное аудио на хостинг...")
+    try:
+        audio_url = github_upload_audio(io.BytesIO(data["full_audio"]), f"lesson_{lesson_id}.mp3")
+        update_audio_url(lesson_id, audio_url)
+        await message.answer("✅ Готово! Аудио загружено на сайт.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
     await state.clear()
 
 # ==========================================
@@ -124,68 +134,56 @@ async def existing_book_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("В базе нет ни одной книги. Сначала создай новую.")
         return
     await state.update_data(book_id=last_book["id"], title=last_book["title"])
-    await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне ссылку на видео с YouTube.")
-    await state.set_state(ExistingBookForm.youtube_url)
+    await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл (или его части).")
+    await state.set_state(ExistingBookForm.audio_parts)
+    audio_chunks[callback.from_user.id] = []
 
-@router.message(ExistingBookForm.youtube_url)
-async def existing_book_url(message: Message, state: FSMContext):
-    url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("Это не похоже на ссылку. Отправь ссылку с YouTube:")
-        return
+@router.message(ExistingBookForm.audio_parts, F.voice | F.audio | F.document)
+async def existing_book_audio(message: Message, state: FSMContext, bot: Bot):
+    if message.voice: file_id = message.voice.file_id
+    elif message.audio: file_id = message.audio.file_id
+    else: file_id = message.document.file_id
     
-    await state.update_data(youtube_url=url)
-    await message.answer("Ссылка получена! Теперь напиши:\n1) Часть\n2) О чем запись\n(каждый пункт с новой строки)")
-    await state.set_state(ExistingBookForm.details)
+    file_obj = await bot.download(file_id)
+    audio_chunks[message.from_user.id].append(file_obj.getvalue())
+    
+    await message.answer(f"Часть {len(audio_chunks[message.from_user.id])} получена! Отправь следующую или заверши загрузку.")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Завершить загрузку", callback_data="finish_upload_existing")]
+    ])
+    await message.answer("Когда закончишь:", reply_markup=kb)
 
-@router.message(ExistingBookForm.details)
-async def existing_book_details(message: Message, state: FSMContext, bot: Bot):
-    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
-    part = int(re.sub(r'\D', '', lines[0])) if lines and re.sub(r'\D', '', lines[0]) else 1
-    description = lines[1] if len(lines) > 1 else "Без описания"
+@router.callback_query(F.data == "finish_upload_existing")
+async def finish_upload_existing(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    if user_id not in audio_chunks or not audio_chunks[user_id]:
+        await callback.message.edit_text("Вы не отправили ни одного файла.")
+        return
+
+    final_file = io.BytesIO()
+    for chunk in audio_chunks[user_id]:
+        final_file.write(chunk)
+    final_file.seek(0)
+    
+    await state.update_data(full_audio=final_file.getvalue())
+    audio_chunks[user_id] = []
+    
+    await callback.message.edit_text("Аудио собрано!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
+    await state.set_state(ExistingBookForm.lesson_title)
+
+@router.message(ExistingBookForm.lesson_title)
+async def existing_book_lesson_title(message: Message, state: FSMContext, bot: Bot):
+    lesson_title = message.text.strip()
     data = await state.get_data()
     
-    lesson_data = {"book_id": data["book_id"], "lesson_number": part, "part": part, "description": description}
-    lesson_id = save_lesson(lesson_data)
+    lesson_id = save_lesson({"book_id": data["book_id"], "lesson_title": lesson_title})
     
-    await message.answer("⏳ Скачиваю аудио с YouTube и загружаю на хостинг...")
-    await process_youtube_to_github(message, data["youtube_url"], lesson_id)
-    await state.clear()
-
-# ==========================================
-# ФУНКЦИЯ СКАЧИВАНИЯ И ЗАГРУЗКИ
-# ==========================================
-async def process_youtube_to_github(message: Message, url: str, lesson_id: int):
+    await message.answer("⏳ Загружаю склеенное аудио на хостинг...")
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': '-', 
-            'quiet': True,
-            'no_warnings': True,
-            'logtostderr': True,
-            'cookiefile': 'cookies.txt',
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            ext = info.get('ext', 'webm') 
-        
-        buffer = io.BytesIO()
-        
-        with redirect_stdout(buffer), yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        audio_bytes = buffer.getvalue()
-        
-        if len(audio_bytes) < 1000:
-            raise Exception("Не удалось скачать аудио (файл слишком мал).")
-
-        filename = f"lesson_{lesson_id}.{ext}"
-        
-        audio_url = github_upload_audio(io.BytesIO(audio_bytes), filename)
+        audio_url = github_upload_audio(io.BytesIO(data["full_audio"]), f"lesson_{lesson_id}.mp3")
         update_audio_url(lesson_id, audio_url)
-        
-        await message.answer(f"✅ Готово! Аудио скачано с YouTube и загружено на сайт.")
-        
+        await message.answer("✅ Готово! Аудио загружено на сайт.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка при скачивании/загрузке: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    await state.clear()
