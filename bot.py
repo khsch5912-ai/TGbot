@@ -2,6 +2,15 @@ import re
 import io
 import requests
 from pyrogram import Client, filters
+import asyncio
+
+# Костыль для совместимости Pyrogram с Python 3.14+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from config import settings
