@@ -5,8 +5,6 @@ from config import settings
 def init_db():
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
-    
-    # Таблица книг
     c.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -15,8 +13,6 @@ def init_db():
             slug TEXT UNIQUE
         )
     """)
-    
-    # Таблица уроков (упрощенная)
     c.execute("""
         CREATE TABLE IF NOT EXISTS lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
