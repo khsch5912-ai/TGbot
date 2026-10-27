@@ -1,18 +1,9 @@
 import re
 import io
 import requests
-from pyrogram import Client, filters
 import asyncio
-
-# Костыль для совместимости Pyrogram с Python 3.14+
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
@@ -37,19 +28,18 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     return upload_resp.json()["browser_download_url"]
 
 # --- ИНИЦИАЛИЗАЦИЯ PYROGRAM ---
-# Pyrogram использует API_ID и API_HASH. Бот работает через MTProto.
 app = Client(
     "audio_book_bot",
-    api_id=settings.api_id,       # Добавь в config.py
-    api_hash=settings.api_hash,   # Добавь в config.py
+    api_id=settings.api_id,
+    api_hash=settings.api_hash,
     bot_token=settings.bot_token
 )
 
-# --- СОСТОЯНИЯ (Pyrogram не имеет встроенного FSM как aiogram, поэтому используем словарь) ---
-user_states = {} # { user_id: {"step": "...", "data": {...}} }
+user_states = {}
 
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message: Message):
+    print(f"Получено сообщение от {message.from_user.id}", flush=True)
     user_id = message.from_user.id
     user_states[user_id] = {"step": None, "data": {}}
     
@@ -81,15 +71,14 @@ async def handle_audio(client, message: Message):
     state = user_states.get(user_id)
     
     if not state or state.get("step") != "waiting_audio":
-        return # Игнорируем файлы вне контекста
+        return 
     
     status_msg = await message.reply_text("⏳ Скачиваю файл (без лимитов MTProto)...")
     
     try:
-        # Pyrogram скачивает файл в память без ограничений
+        # Скачиваем в память
         file_bytes = await client.download_media(message, in_memory=True)
         
-        # Сохраняем в состояние
         user_states[user_id]["data"]["audio_data"] = file_bytes.getvalue()
         user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_lesson_title"
         
