@@ -1,18 +1,18 @@
 import os
-import asyncio
 import threading
 import sqlite3
 from flask import Flask, jsonify
 from flask_cors import CORS
 from config import settings
 from database import init_db
-from bot import router
-
-from aiogram import Bot, Dispatcher
+from bot import app as pyro_app  # Импортируем Pyrogram-клиента
 
 app = Flask(__name__)
 CORS(app)
 
+# ==========================================
+# API ДЛЯ САЙТА
+# ==========================================
 @app.route('/api/lessons.json')
 def api_lessons_json():
     conn = sqlite3.connect(settings.db_path)
@@ -38,20 +38,21 @@ def api_lessons_json():
 
 @app.route('/')
 def index():
-    return "API is running"
+    return "API is running successfully!"
 
-async def start_bot():
-    bot = Bot(token=settings.bot_token)
-    dp = Dispatcher()
-    dp.include_router(router)
-    print("Бот запущен...")
-    await dp.start_polling(bot, handle_signals=False)
-
+# ==========================================
+# ЗАПУСК БОТА И САЙТА
+# ==========================================
 def run_bot_thread():
-    asyncio.run(start_bot())
+    # Запускаем Pyrogram клиента
+    pyro_app.run()
 
 if __name__ == '__main__':
     init_db()
+    
+    # Запускаем бота в фоновом потоке
     threading.Thread(target=run_bot_thread, daemon=True).start()
+    
+    # Запускаем Flask
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
