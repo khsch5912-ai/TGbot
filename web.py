@@ -38,19 +38,20 @@ def api_lessons_json():
 def index():
     return "API is running successfully!"
 
+# --- НОВАЯ ФУНКЦИЯ ЗАПУСКА БОТА ---
+async def start_bot_async():
+    # Запускаем клиента и ждем, пока он не остановится
+    await pyro_app.start()
+    print("Бот успешно подключен к Telegram!", flush=True)
+    
+    # Держим клиента активным (это заменяет idle())
+    await pyro_app.idle()
+
 def run_bot_thread():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
         print("Запускаю бота в фоне...", flush=True)
-        
-        # Запускаем клиента (безопасно для потоков, без перехвата сигналов)
-        loop.run_until_complete(pyro_app.start())
-        print("Бот успешно подключен к Telegram и слушает сообщения!", flush=True)
-        
-        # Держим цикл активным, чтобы бот не отключился
-        loop.run_forever()
-        
+        # Запускаем асинхронную функцию в новом цикле событий
+        asyncio.run(start_bot_async())
     except Exception as e:
         print(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ БОТА: {e}", flush=True)
 
