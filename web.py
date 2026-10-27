@@ -19,39 +19,26 @@ def api_lessons_json():
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("""
-        SELECT b.title as book_title, b.author, b.slug as book_slug, l.id, l.part, l.description, l.audio_url 
-        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.part
+        SELECT b.title as book_title, b.author, b.slug as book_slug, 
+               l.id, l.lesson_title, l.audio_url 
+        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.id
     """)
     lessons = [dict(r) for r in c.fetchall()]
     conn.close()
+
     data = {"books": {}}
     for l in lessons:
         book = l["book_title"]
         if book not in data["books"]:
             data["books"][book] = {"author": l["author"], "slug": l["book_slug"], "lessons": []}
-        data["books"][book]["lessons"].append({"id": l["id"], "part": l["part"], "description": l["description"], "audio_url": l["audio_url"]})
+        data["books"][book]["lessons"].append({
+            "id": l["id"], "title": l["lesson_title"], "audio_url": l["audio_url"]
+        })
     return jsonify(data)
-
-@app.route('/api/book/<slug>.json')
-def api_book_json(slug):
-    conn = sqlite3.connect(settings.db_path)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT id, title, author FROM books WHERE slug = ?", (slug,))
-    book = c.fetchone()
-    if not book:
-        conn.close()
-        return jsonify({"error": "Book not found"}), 404
-
-    c.execute("SELECT id, part, description, audio_url FROM lessons WHERE book_id = ? ORDER BY part", (book["id"],))
-    lessons = [dict(r) for r in c.fetchall()]
-    conn.close()
-
-    return jsonify({"title": book["title"], "author": book["author"], "slug": slug, "lessons": lessons})
 
 @app.route('/')
 def index():
-    return "API is running. Go to /api/lessons.json"
+    return "API is running"
 
 async def start_bot():
     bot = Bot(token=settings.bot_token)
