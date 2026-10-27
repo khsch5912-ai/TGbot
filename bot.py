@@ -2,6 +2,7 @@ import re
 import io
 import requests
 import asyncio
+import aiohttp
 from aiogram import F, Router, Bot
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -30,29 +31,40 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     upload_resp.raise_for_status()
     return upload_resp.json()["browser_download_url"]
 
-# --- АЛГОРИТМ ОБХОДА ЛИМИТА 20 МБ ---
-async def download_large_file(bot: Bot, file_id: str, file_size: int) -> io.BytesIO:
-    """
-    Скачивает файл любого размера, автоматически разбивая его на части,
-    если он превышает лимит Bot API.
-    """
-    limit = 20 * 1024 * 1024 # 20 МБ
+# ==========================================
+# ПРАВИЛЬНЫЙ АЛГОРИТМ СКАЧИВАНИЯ (БЕЗ ЛИМИТА)
+# ==========================================
+async def download_file_with_progress(bot: Bot, file_id: str, file_size: int, message: Message) -> io.BytesIO:
+    file_info = await bot.get_file(file_id)
+    file_path = file_info.file_path
+    url = f"https://api.telegram.org/file/bot{settings.bot_token}/{file_path}"
+
     buffer = io.BytesIO()
+    downloaded = 0
+    status_message = await message.answer("⏳ Скачиваю файл: 0%")
 
-    if file_size <= limit:
-        # Файл маленький, качаем целиком
-        file_obj = await bot.download(file_id)
-        buffer.write(file_obj.getvalue())
-    else:
-        # Файл большой, качаем по частям через offset
-        offset = 0
-        while offset < file_size:
-            chunk_size = min(limit, file_size - offset)
-            # Скачиваем кусок
-            chunk = await bot.download(file_id, offset=offset, limit=chunk_size)
-            buffer.write(chunk.getvalue())
-            offset += chunk_size
+    async with aiohttp.ClientSession() as session:
+        # Качаем кусками по 10 МБ, чтобы не превышать лимиты и показывать прогресс
+        chunk_size = 10 * 1024 * 1024 
+        while downloaded < file_size:
+            headers = {"Range": f"bytes={downloaded}-{downloaded + chunk_size - 1}"}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status not in (200, 206):
+                    raise Exception(f"Ошибка сервера Telegram: {resp.status}")
+                
+                chunk = await resp.read()
+                buffer.write(chunk)
+                downloaded += len(chunk)
+                
+                # Обновляем индикатор каждые 20%
+                percent = int((downloaded / file_size) * 100)
+                if percent % 20 == 0:
+                    try:
+                        await status_message.edit_text(f"⏳ Скачиваю файл: {percent}%")
+                    except:
+                        pass # Игнорируем ошибки редактирования, если сообщение слишком старое
 
+    await status_message.edit_text("✅ Файл скачан! Загружаю на GitHub...")
     buffer.seek(0)
     return buffer
 
@@ -82,31 +94,28 @@ async def cmd_start(message: Message, state: FSMContext):
 # ==========================================
 @router.callback_query(F.data == "flow_new")
 async def new_book_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл.")
+    await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл (можно больше 20 МБ, я сам разберусь).")
     await state.set_state(NewBookForm.audio_file)
 
 @router.message(NewBookForm.audio_file, F.voice | F.audio | F.document)
 async def new_book_audio(message: Message, state: FSMContext, bot: Bot):
     if message.voice: 
-        file_id = message.voice.file_id
-        file_size = message.voice.file_size
+        file_id, file_size = message.voice.file_id, message.voice.file_size
     elif message.audio: 
-        file_id = message.audio.file_id
-        file_size = message.audio.file_size
+        file_id, file_size = message.audio.file_id, message.audio.file_size
     else: 
-        file_id = message.document.file_id
-        file_size = message.document.file_size
+        file_id, file_size = message.document.file_id, message.document.file_size
     
-    await message.answer("⏳ Принял файл, обрабатываю (это может занять время)...")
-    
-    # Скачиваем любой файл, даже 50 МБ, через наш алгоритм
-    file_data = await download_large_file(bot, file_id, file_size)
-    
-    # Сохраняем в память (в реальном проекте лучше передавать управление)
-    await state.update_data(audio_data=file_data.getvalue())
-    
-    await message.answer("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
-    await state.set_state(NewBookForm.title_author)
+    try:
+        # Скачиваем файл с индикатором прогресса
+        file_data = await download_file_with_progress(bot, file_id, file_size, message)
+        await state.update_data(audio_data=file_data.getvalue())
+        
+        await message.answer("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+        await state.set_state(NewBookForm.title_author)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при скачивании: {e}")
+        await state.clear()
 
 @router.message(NewBookForm.title_author)
 async def new_book_title(message: Message, state: FSMContext):
@@ -128,13 +137,13 @@ async def new_book_lesson_title(message: Message, state: FSMContext):
     book_id = get_or_create_book(data["title"], data["author"], slug)
     lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title})
     
-    await message.answer("⏳ Загружаю аудио на хостинг...")
+    status_msg = await message.answer("⏳ Загружаю на GitHub...")
     try:
         audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
         update_audio_url(lesson_id, audio_url)
-        await message.answer("✅ Готово! Аудио загружено на сайт.")
+        await status_msg.edit_text("✅ Готово! Аудио загружено на сайт.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
     await state.clear()
 
 # ==========================================
@@ -153,22 +162,21 @@ async def existing_book_start(callback: CallbackQuery, state: FSMContext):
 @router.message(ExistingBookForm.audio_file, F.voice | F.audio | F.document)
 async def existing_book_audio(message: Message, state: FSMContext, bot: Bot):
     if message.voice: 
-        file_id = message.voice.file_id
-        file_size = message.voice.file_size
+        file_id, file_size = message.voice.file_id, message.voice.file_size
     elif message.audio: 
-        file_id = message.audio.file_id
-        file_size = message.audio.file_size
+        file_id, file_size = message.audio.file_id, message.audio.file_size
     else: 
-        file_id = message.document.file_id
-        file_size = message.document.file_size
+        file_id, file_size = message.document.file_id, message.document.file_size
         
-    await message.answer("⏳ Принял файл, обрабатываю...")
-    file_data = await download_large_file(bot, file_id, file_size)
-    
-    await state.update_data(audio_data=file_data.getvalue())
-    
-    await message.answer("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
-    await state.set_state(ExistingBookForm.lesson_title)
+    try:
+        file_data = await download_file_with_progress(bot, file_id, file_size, message)
+        await state.update_data(audio_data=file_data.getvalue())
+        
+        await message.answer("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
+        await state.set_state(ExistingBookForm.lesson_title)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+        await state.clear()
 
 @router.message(ExistingBookForm.lesson_title)
 async def existing_book_lesson_title(message: Message, state: FSMContext):
@@ -177,11 +185,11 @@ async def existing_book_lesson_title(message: Message, state: FSMContext):
     
     lesson_id = save_lesson({"book_id": data["book_id"], "lesson_title": lesson_title})
     
-    await message.answer("⏳ Загружаю аудио на хостинг...")
+    status_msg = await message.answer("⏳ Загружаю на GitHub...")
     try:
         audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
         update_audio_url(lesson_id, audio_url)
-        await message.answer("✅ Готово! Аудио загружено на сайт.")
+        await status_msg.edit_text("✅ Готово! Аудио загружено на сайт.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
     await state.clear()
