@@ -39,7 +39,7 @@ user_states = {}
 
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message: Message):
-    print(f"Получено сообщение от {message.from_user.id}", flush=True)
+    print(f"=== ПОЛУЧЕНО /start ОТ {message.from_user.id} ===", flush=True)
     user_id = message.from_user.id
     user_states[user_id] = {"step": None, "data": {}}
     
@@ -47,10 +47,16 @@ async def cmd_start(client, message: Message):
         [InlineKeyboardButton("1. Записать новую книгу", callback_data="flow_new")],
         [InlineKeyboardButton("2. Продолжить существующую", callback_data="flow_existing")]
     ])
-    await message.reply_text("Выбери действие:", reply_markup=kb)
+    
+    try:
+        await message.reply_text("Выбери действие:", reply_markup=kb)
+        print("=== ОТВЕТ УСПЕШНО ОТПРАВЛЕН ===", flush=True)
+    except Exception as e:
+        print(f"=== ОШИБКА ОТПРАВКИ: {e} ===", flush=True)
 
 @app.on_callback_query()
 async def handle_callback(client, callback: CallbackQuery):
+    print(f"=== НАЖАТА КНОПКА: {callback.data} ===", flush=True)
     user_id = callback.from_user.id
     data = callback.data
     
@@ -67,17 +73,20 @@ async def handle_callback(client, callback: CallbackQuery):
 
 @app.on_message(filters.audio | filters.voice | filters.document)
 async def handle_audio(client, message: Message):
+    print(f"=== ПОЛУЧЕН ФАЙЛ ОТ {message.from_user.id} ===", flush=True)
     user_id = message.from_user.id
     state = user_states.get(user_id)
     
     if not state or state.get("step") != "waiting_audio":
+        print("=== ФАЙЛ ПРОИГНОРИРОВАН (неверное состояние) ===", flush=True)
         return 
     
     status_msg = await message.reply_text("⏳ Скачиваю файл (без лимитов MTProto)...")
+    print("=== НАЧАЛО СКАЧИВАНИЯ ===", flush=True)
     
     try:
-        # Скачиваем в память
         file_bytes = await client.download_media(message, in_memory=True)
+        print("=== ФАЙЛ УСПЕШНО СКАЧАН ===", flush=True)
         
         user_states[user_id]["data"]["audio_data"] = file_bytes.getvalue()
         user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_lesson_title"
@@ -88,46 +97,6 @@ async def handle_audio(client, message: Message):
             await status_msg.edit_text("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
             
     except Exception as e:
+        print(f"=== ОШИБКА СКАЧИВАНИЯ: {e} ===", flush=True)
         await status_msg.edit_text(f"❌ Ошибка: {e}")
-        user_states[user_id] = None
-
-@app.on_message(filters.text & ~filters.command("start"))
-async def handle_text(client, message: Message):
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
-    
-    if not state: return
-    
-    text = message.text.strip()
-    
-    if state["step"] == "waiting_title":
-        if "," not in text:
-            await message.reply_text("Пожалуйста, укажи название и автора через запятую.")
-            return
-        title, author = [x.strip() for x in text.split(",", 1)]
-        user_states[user_id]["data"]["title"] = title
-        user_states[user_id]["data"]["author"] = author
-        user_states[user_id]["step"] = "waiting_lesson_title"
-        await message.reply_text("Теперь напиши название урока:")
-        
-    elif state["step"] == "waiting_lesson_title":
-        lesson_title = text
-        data = state["data"]
-        
-        if data["is_new"]:
-            slug = make_slug(data["title"])
-            book_id = get_or_create_book(data["title"], data["author"], slug)
-        else:
-            book_id = data["book_id"]
-            
-        lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title})
-        
-        status_msg = await message.reply_text("⏳ Загружаю на GitHub...")
-        try:
-            audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
-            update_audio_url(lesson_id, audio_url)
-            await status_msg.edit_text("✅ Готово! Аудио загружено на сайт.")
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка: {e}")
-            
         user_states[user_id] = None
