@@ -43,13 +43,23 @@ def run_bot_thread():
     asyncio.set_event_loop(loop)
     try:
         print("Запускаю бота в фоне...", flush=True)
-        # Используем pyro_app.run() для блокирующего запуска внутри потока
-        pyro_app.run()
+        
+        # Запускаем клиента (безопасно для потоков, без перехвата сигналов)
+        loop.run_until_complete(pyro_app.start())
+        print("Бот успешно подключен к Telegram и слушает сообщения!", flush=True)
+        
+        # Держим цикл активным, чтобы бот не отключился
+        loop.run_forever()
+        
     except Exception as e:
         print(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ БОТА: {e}", flush=True)
 
 if __name__ == '__main__':
     init_db()
+    
+    # Запускаем бота в отдельном потоке
     threading.Thread(target=run_bot_thread, daemon=True).start()
+    
+    # Запускаем Flask
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
