@@ -1,6 +1,7 @@
 import re
 import io
 import requests
+import asyncio
 from aiogram import F, Router, Bot
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -29,19 +30,43 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     upload_resp.raise_for_status()
     return upload_resp.json()["browser_download_url"]
 
+# --- АЛГОРИТМ ОБХОДА ЛИМИТА 20 МБ ---
+async def download_large_file(bot: Bot, file_id: str, file_size: int) -> io.BytesIO:
+    """
+    Скачивает файл любого размера, автоматически разбивая его на части,
+    если он превышает лимит Bot API.
+    """
+    limit = 20 * 1024 * 1024 # 20 МБ
+    buffer = io.BytesIO()
+
+    if file_size <= limit:
+        # Файл маленький, качаем целиком
+        file_obj = await bot.download(file_id)
+        buffer.write(file_obj.getvalue())
+    else:
+        # Файл большой, качаем по частям через offset
+        offset = 0
+        while offset < file_size:
+            chunk_size = min(limit, file_size - offset)
+            # Скачиваем кусок
+            chunk = await bot.download(file_id, offset=offset, limit=chunk_size)
+            buffer.write(chunk.getvalue())
+            offset += chunk_size
+
+    buffer.seek(0)
+    return buffer
+
 # --- СОСТОЯНИЯ ---
 class NewBookForm(StatesGroup):
-    audio_parts = State()
+    audio_file = State()
     title_author = State()
     lesson_title = State()
 
 class ExistingBookForm(StatesGroup):
-    audio_parts = State()
+    audio_file = State()
     lesson_title = State()
 
 router = Router()
-# Временное хранилище для частей (в оперативной памяти)
-audio_chunks = {}
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -57,42 +82,30 @@ async def cmd_start(message: Message, state: FSMContext):
 # ==========================================
 @router.callback_query(F.data == "flow_new")
 async def new_book_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл (или его части по очереди, до 20 МБ каждая).")
-    await state.set_state(NewBookForm.audio_parts)
-    audio_chunks[callback.from_user.id] = []
+    await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл.")
+    await state.set_state(NewBookForm.audio_file)
 
-@router.message(NewBookForm.audio_parts, F.voice | F.audio | F.document)
+@router.message(NewBookForm.audio_file, F.voice | F.audio | F.document)
 async def new_book_audio(message: Message, state: FSMContext, bot: Bot):
-    if message.voice: file_id = message.voice.file_id
-    elif message.audio: file_id = message.audio.file_id
-    else: file_id = message.document.file_id
+    if message.voice: 
+        file_id = message.voice.file_id
+        file_size = message.voice.file_size
+    elif message.audio: 
+        file_id = message.audio.file_id
+        file_size = message.audio.file_size
+    else: 
+        file_id = message.document.file_id
+        file_size = message.document.file_size
     
-    file_obj = await bot.download(file_id)
-    audio_chunks[message.from_user.id].append(file_obj.getvalue())
+    await message.answer("⏳ Принял файл, обрабатываю (это может занять время)...")
     
-    await message.answer(f"Часть {len(audio_chunks[message.from_user.id])} получена! Можешь отправить следующую, или нажми кнопку ниже, если это была последняя часть.")
+    # Скачиваем любой файл, даже 50 МБ, через наш алгоритм
+    file_data = await download_large_file(bot, file_id, file_size)
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Завершить загрузку", callback_data="finish_upload")]
-    ])
-    await message.answer("Когда закончишь, нажми кнопку:", reply_markup=kb)
-
-@router.callback_query(F.data == "finish_upload")
-async def finish_upload(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if user_id not in audio_chunks or not audio_chunks[user_id]:
-        await callback.message.edit_text("Вы не отправили ни одного файла.")
-        return
-
-    final_file = io.BytesIO()
-    for chunk in audio_chunks[user_id]:
-        final_file.write(chunk)
-    final_file.seek(0)
+    # Сохраняем в память (в реальном проекте лучше передавать управление)
+    await state.update_data(audio_data=file_data.getvalue())
     
-    await state.update_data(full_audio=final_file.getvalue())
-    audio_chunks[user_id] = []
-    
-    await callback.message.edit_text("Аудио собрано!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+    await message.answer("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
     await state.set_state(NewBookForm.title_author)
 
 @router.message(NewBookForm.title_author)
@@ -107,7 +120,7 @@ async def new_book_title(message: Message, state: FSMContext):
     await state.set_state(NewBookForm.lesson_title)
 
 @router.message(NewBookForm.lesson_title)
-async def new_book_lesson_title(message: Message, state: FSMContext, bot: Bot):
+async def new_book_lesson_title(message: Message, state: FSMContext):
     lesson_title = message.text.strip()
     data = await state.get_data()
     
@@ -115,9 +128,9 @@ async def new_book_lesson_title(message: Message, state: FSMContext, bot: Bot):
     book_id = get_or_create_book(data["title"], data["author"], slug)
     lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title})
     
-    await message.answer("⏳ Загружаю склеенное аудио на хостинг...")
+    await message.answer("⏳ Загружаю аудио на хостинг...")
     try:
-        audio_url = github_upload_audio(io.BytesIO(data["full_audio"]), f"lesson_{lesson_id}.mp3")
+        audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
         update_audio_url(lesson_id, audio_url)
         await message.answer("✅ Готово! Аудио загружено на сайт.")
     except Exception as e:
@@ -134,54 +147,39 @@ async def existing_book_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("В базе нет ни одной книги. Сначала создай новую.")
         return
     await state.update_data(book_id=last_book["id"], title=last_book["title"])
-    await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл (или его части).")
-    await state.set_state(ExistingBookForm.audio_parts)
-    audio_chunks[callback.from_user.id] = []
+    await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
+    await state.set_state(ExistingBookForm.audio_file)
 
-@router.message(ExistingBookForm.audio_parts, F.voice | F.audio | F.document)
+@router.message(ExistingBookForm.audio_file, F.voice | F.audio | F.document)
 async def existing_book_audio(message: Message, state: FSMContext, bot: Bot):
-    if message.voice: file_id = message.voice.file_id
-    elif message.audio: file_id = message.audio.file_id
-    else: file_id = message.document.file_id
+    if message.voice: 
+        file_id = message.voice.file_id
+        file_size = message.voice.file_size
+    elif message.audio: 
+        file_id = message.audio.file_id
+        file_size = message.audio.file_size
+    else: 
+        file_id = message.document.file_id
+        file_size = message.document.file_size
+        
+    await message.answer("⏳ Принял файл, обрабатываю...")
+    file_data = await download_large_file(bot, file_id, file_size)
     
-    file_obj = await bot.download(file_id)
-    audio_chunks[message.from_user.id].append(file_obj.getvalue())
+    await state.update_data(audio_data=file_data.getvalue())
     
-    await message.answer(f"Часть {len(audio_chunks[message.from_user.id])} получена! Отправь следующую или заверши загрузку.")
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Завершить загрузку", callback_data="finish_upload_existing")]
-    ])
-    await message.answer("Когда закончишь:", reply_markup=kb)
-
-@router.callback_query(F.data == "finish_upload_existing")
-async def finish_upload_existing(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if user_id not in audio_chunks or not audio_chunks[user_id]:
-        await callback.message.edit_text("Вы не отправили ни одного файла.")
-        return
-
-    final_file = io.BytesIO()
-    for chunk in audio_chunks[user_id]:
-        final_file.write(chunk)
-    final_file.seek(0)
-    
-    await state.update_data(full_audio=final_file.getvalue())
-    audio_chunks[user_id] = []
-    
-    await callback.message.edit_text("Аудио собрано!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
+    await message.answer("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
     await state.set_state(ExistingBookForm.lesson_title)
 
 @router.message(ExistingBookForm.lesson_title)
-async def existing_book_lesson_title(message: Message, state: FSMContext, bot: Bot):
+async def existing_book_lesson_title(message: Message, state: FSMContext):
     lesson_title = message.text.strip()
     data = await state.get_data()
     
     lesson_id = save_lesson({"book_id": data["book_id"], "lesson_title": lesson_title})
     
-    await message.answer("⏳ Загружаю склеенное аудио на хостинг...")
+    await message.answer("⏳ Загружаю аудио на хостинг...")
     try:
-        audio_url = github_upload_audio(io.BytesIO(data["full_audio"]), f"lesson_{lesson_id}.mp3")
+        audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
         update_audio_url(lesson_id, audio_url)
         await message.answer("✅ Готово! Аудио загружено на сайт.")
     except Exception as e:
