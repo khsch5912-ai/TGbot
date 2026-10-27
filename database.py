@@ -5,6 +5,8 @@ from config import settings
 def init_db():
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
+    
+    # Таблица книг
     c.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13,13 +15,13 @@ def init_db():
             slug TEXT UNIQUE
         )
     """)
+    
+    # Таблица уроков (упрощенная)
     c.execute("""
         CREATE TABLE IF NOT EXISTS lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             book_id INTEGER,
-            lesson_number INTEGER,
-            part INTEGER,
-            description TEXT,
+            lesson_title TEXT,
             audio_url TEXT,
             created_at TEXT,
             FOREIGN KEY(book_id) REFERENCES books(id)
@@ -47,9 +49,9 @@ def save_lesson(data: dict) -> int:
     conn = sqlite3.connect(settings.db_path)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO lessons (book_id, lesson_number, part, description, audio_url, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (data["book_id"], data["lesson_number"], data["part"], data["description"], data.get("audio_url", ""), datetime.utcnow().isoformat()))
+        INSERT INTO lessons (book_id, lesson_title, audio_url, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (data["book_id"], data["lesson_title"], data.get("audio_url", ""), datetime.utcnow().isoformat()))
     lesson_id = c.lastrowid
     conn.commit()
     conn.close()
