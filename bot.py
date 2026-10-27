@@ -1,102 +1,74 @@
-import re
-import io
-import requests
+import os
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+import sqlite3
+from flask import Flask, jsonify
+from flask_cors import CORS
+from pyrogram import idle
 from config import settings
-from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
+from database import init_db
+from bot import app as pyro_app
 
-def make_slug(title: str) -> str:
-    eng_words = re.findall(r'[a-zA-Z0-9]+', title)
-    if eng_words: return "-".join(eng_words).lower()
-    return f"book-{abs(hash(title)) % 10000}"
+# ==========================================
+# 1. НАСТРОЙКА FLASK
+# ==========================================
+flask_app = Flask(__name__)
+CORS(flask_app)
 
-def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
-    headers = {"Authorization": f"token {settings.github_token}", "Accept": "application/vnd.github.v3+json"}
-    tag = filename.rsplit(".", 1)[0].replace(" ", "_")
-    payload = {"tag_name": tag, "name": f"Файл {tag}", "body": "Загружено", "draft": False, "prerelease": False}
-    resp = requests.post(f"https://api.github.com/repos/{settings.github_repo}/releases", json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    upload_url = resp.json()["upload_url"].split("{")[0]
-    
-    upload_headers = headers.copy()
-    upload_headers["Content-Type"] = "application/octet-stream"
-    file_bytes.seek(0)
-    upload_resp = requests.post(f"{upload_url}?name={filename}", headers=upload_headers, data=file_bytes.getvalue(), timeout=300)
-    upload_resp.raise_for_status()
-    return upload_resp.json()["browser_download_url"]
+@flask_app.route('/api/lessons.json')
+def api_lessons_json():
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT b.title as book_title, b.author, b.slug as book_slug, 
+               l.id, l.lesson_title, l.audio_url 
+        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.id
+    """)
+    lessons = [dict(r) for r in c.fetchall()]
+    conn.close()
 
-# --- ИНИЦИАЛИЗАЦИЯ PYROGRAM ---
-app = Client(
-    "audio_book_bot",
-    api_id=settings.api_id,
-    api_hash=settings.api_hash,
-    bot_token=settings.bot_token
-)
+    data = {"books": {}}
+    for l in lessons:
+        book = l["book_title"]
+        if book not in data["books"]:
+            data["books"][book] = {"author": l["author"], "slug": l["book_slug"], "lessons": []}
+        data["books"][book]["lessons"].append({
+            "id": l["id"], "title": l["lesson_title"], "audio_url": l["audio_url"]
+        })
+    return jsonify(data)
 
-user_states = {}
+@flask_app.route('/')
+def index():
+    return "API is running successfully!"
 
-@app.on_message(filters.command("start"))
-async def cmd_start(client, message: Message):
-    print(f"=== ПОЛУЧЕНО /start ОТ {message.from_user.id} ===", flush=True)
-    user_id = message.from_user.id
-    user_states[user_id] = {"step": None, "data": {}}
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("1. Записать новую книгу", callback_data="flow_new")],
-        [InlineKeyboardButton("2. Продолжить существующую", callback_data="flow_existing")]
-    ])
-    
-    try:
-        await message.reply_text("Выбери действие:", reply_markup=kb)
-        print("=== ОТВЕТ УСПЕШНО ОТПРАВЛЕН ===", flush=True)
-    except Exception as e:
-        print(f"=== ОШИБКА ОТПРАВКИ: {e} ===", flush=True)
+# ==========================================
+# 2. ЗАПУСК FLASK В ФОНОВОМ ПОТОКЕ
+# ==========================================
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
-@app.on_callback_query()
-async def handle_callback(client, callback: CallbackQuery):
-    print(f"=== НАЖАТА КНОПКА: {callback.data} ===", flush=True)
-    user_id = callback.from_user.id
-    data = callback.data
-    
-    if data == "flow_new":
-        user_states[user_id] = {"step": "waiting_audio", "data": {"is_new": True}}
-        await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл (любого размера).")
-    elif data == "flow_existing":
-        last_book = get_last_book()
-        if not last_book:
-            await callback.message.edit_text("В базе нет ни одной книги.")
-            return
-        user_states[user_id] = {"step": "waiting_audio", "data": {"is_new": False, "book_id": last_book["id"], "title": last_book["title"]}}
-        await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
+# ==========================================
+# 3. ГЛАВНАЯ АСИНХРОННАЯ ФУНКЦИЯ
+# ==========================================
+async def main():
+    # 1. Запускаем Flask в фоне
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("Flask сервер запущен в фоновом потоке.", flush=True)
 
-@app.on_message(filters.audio | filters.voice | filters.document)
-async def handle_audio(client, message: Message):
-    print(f"=== ПОЛУЧЕН ФАЙЛ ОТ {message.from_user.id} ===", flush=True)
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
-    
-    if not state or state.get("step") != "waiting_audio":
-        print("=== ФАЙЛ ПРОИГНОРИРОВАН (неверное состояние) ===", flush=True)
-        return 
-    
-    status_msg = await message.reply_text("⏳ Скачиваю файл (без лимитов MTProto)...")
-    print("=== НАЧАЛО СКАЧИВАНИЯ ===", flush=True)
-    
-    try:
-        file_bytes = await client.download_media(message, in_memory=True)
-        print("=== ФАЙЛ УСПЕШНО СКАЧАН ===", flush=True)
-        
-        user_states[user_id]["data"]["audio_data"] = file_bytes.getvalue()
-        user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_lesson_title"
-        
-        if state["data"]["is_new"]:
-            await status_msg.edit_text("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
-        else:
-            await status_msg.edit_text("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
-            
-    except Exception as e:
-        print(f"=== ОШИБКА СКАЧИВАНИЯ: {e} ===", flush=True)
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
-        user_states[user_id] = None
+    # 2. Запускаем бота в ГЛАВНОМ потоке
+    print("Запускаю Telegram-бота...", flush=True)
+    await pyro_app.start()
+    print("Бот успешно подключен к Telegram и слушает сообщения!", flush=True)
+
+    # 3. Ждем, пока бот работает (это не дает главному потоку закрыться)
+    await idle()
+
+# ==========================================
+# 4. ТОЧКА ВХОДА
+# ==========================================
+if __name__ == "__main__":
+    init_db()
+    asyncio.run(main())
