@@ -42,12 +42,12 @@ def run_bot_thread():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        print("Запускаю бота в фоне...")
+        print("Запускаю бота в фоне...", flush=True)
         loop.run_until_complete(pyro_app.start())
-        print("Бот запущен и слушает сообщения.")
+        print("Бот успешно подключен к Telegram и слушает сообщения!", flush=True)
         loop.run_forever()
     except Exception as e:
-        print(f"Ошибка при запуске бота: {e}")
+        print(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ БОТА: {e}", flush=True)
 
 if __name__ == '__main__':
     init_db()
