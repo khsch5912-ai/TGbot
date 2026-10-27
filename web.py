@@ -1,66 +1,60 @@
-import os
 import asyncio
 import threading
-import sqlite3
-from flask import Flask, jsonify
-from flask_cors import CORS
-from config import settings
-from database import init_db
-from bot import app as pyro_app
+from flask import Flask
+from pyrogram import Client, idle
 
-app = Flask(__name__)
-CORS(app)
+# ==================== Конфигурация ====================
+# Замените на ваши реальные API_ID, API_HASH и BOT_TOKEN
+API_ID = 123456  # Ваш api_id (целое число)
+API_HASH = "your_api_hash_here"
+BOT_TOKEN = "your_bot_token_here"
 
-@app.route('/api/lessons.json')
-def api_lessons_json():
-    conn = sqlite3.connect(settings.db_path)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("""
-        SELECT b.title as book_title, b.author, b.slug as book_slug, 
-               l.id, l.lesson_title, l.audio_url 
-        FROM lessons l JOIN books b ON l.book_id = b.id ORDER BY b.title, l.id
-    """)
-    lessons = [dict(r) for r in c.fetchall()]
-    conn.close()
+# ==================== Часть Flask ====================
+flask_app = Flask(__name__)
 
-    data = {"books": {}}
-    for l in lessons:
-        book = l["book_title"]
-        if book not in data["books"]:
-            data["books"][book] = {"author": l["author"], "slug": l["book_slug"], "lessons": []}
-        data["books"][book]["lessons"].append({
-            "id": l["id"], "title": l["lesson_title"], "audio_url": l["audio_url"]
-        })
-    return jsonify(data)
+@flask_app.route('/')
+def home():
+    return "Bot is alive!"
 
-@app.route('/')
-def index():
-    return "API is running successfully!"
+def run_flask():
+    """Запуск Flask в отдельном потоке, чтобы не блокировать главный поток"""
+    # На Render обычно используется порт 10000, вы также можете использовать переменную окружения PORT
+    flask_app.run(host='0.0.0.0', port=10000, use_reloader=False)
 
-# --- НОВАЯ ФУНКЦИЯ ЗАПУСКА БОТА ---
-async def start_bot_async():
-    # Запускаем клиента и ждем, пока он не остановится
-    await pyro_app.start()
-    print("Бот успешно подключен к Telegram!", flush=True)
-    
-    # Держим клиента активным (это заменяет idle())
-    await pyro_app.idle()
+# ==================== Часть Pyrogram ====================
+# Создание экземпляра Client
+app = Client(
+    "my_bot",  # Имя сессии, можно указать произвольно
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-def run_bot_thread():
-    try:
-        print("Запускаю бота в фоне...", flush=True)
-        # Запускаем асинхронную функцию в новом цикле событий
-        asyncio.run(start_bot_async())
-    except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ БОТА: {e}", flush=True)
+# Здесь вы можете добавить ваши обработчики (handlers)
+# Например:
+# @app.on_message(filters.command("start"))
+# async def start_handler(client, message):
+#     await message.reply("Hello!")
 
-if __name__ == '__main__':
-    init_db()
-    
-    # Запускаем бота в отдельном потоке
-    threading.Thread(target=run_bot_thread, daemon=True).start()
-    
-    # Запускаем Flask
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+# ==================== Главный запуск ====================
+async def main():
+    # 1. Запуск Flask в фоновом потоке (daemon=True означает автоматическое завершение при выходе из главного потока)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("Flask сервер запущен в фоновом потоке.")
+
+    # 2. Запуск клиента Pyrogram
+    await app.start()
+    print("Бот успешно подключен к Telegram!")
+
+    # 3. Ключевой момент: вызов правильной функции idle(), а не app.idle()
+    # Она будет блокировать главный поток, позволяя боту продолжать получать сообщения
+    await idle()
+
+    # 4. Корректная остановка клиента после получения сигнала (например, Ctrl+C)
+    await app.stop()
+    print("Бот остановлен.")
+
+if __name__ == "__main__":
+    # Запуск асинхронной главной функции
+    asyncio.run(main())
