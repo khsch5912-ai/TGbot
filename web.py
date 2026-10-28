@@ -1,18 +1,15 @@
-import logging
-logging.basicConfig(level=logging.INFO)
 import os
 import asyncio
 import threading
 import sqlite3
 from flask import Flask, jsonify
 from flask_cors import CORS
-from pyrogram import idle
 from config import settings
 from database import init_db
-from bot import app as pyro_app
+from bot import start_bot
 
 # ==========================================
-# 1. НАСТРОЙКА FLASK (API ДЛЯ САЙТА)
+# 1. НАСТРОЙКА FLASK
 # ==========================================
 flask_app = Flask(__name__)
 CORS(flask_app)
@@ -45,10 +42,9 @@ def index():
     return "API is running successfully!"
 
 # ==========================================
-# 2. ФУНКЦИЯ ЗАПУСКА FLASK В ПОТОКЕ
+# 2. ЗАПУСК FLASK В ФОНОВОМ ПОТОКЕ
 # ==========================================
 def run_flask():
-    # Render автоматически передает порт в переменную PORT
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
@@ -56,26 +52,18 @@ def run_flask():
 # 3. ГЛАВНАЯ АСИНХРОННАЯ ФУНКЦИЯ
 # ==========================================
 async def main():
-    # 1. Запускаем Flask в фоновом потоке
+    # 1. Запускаем Flask в фоне
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("Flask сервер запущен в фоновом потоке.", flush=True)
 
-    # 2. Запускаем Pyrogram-бота в главном потоке
-    print("Запускаю Telegram-бота...", flush=True)
-    await pyro_app.start()
-    print("Бот успешно подключен к Telegram и слушает сообщения!", flush=True)
-
-    # 3. Блокируем главный поток, чтобы бот работал бесконечно
-    await idle()
-
-    # 4. Корректная остановка (сработает, если Render выключит сервис)
-    await pyro_app.stop()
-    print("Бот остановлен.", flush=True)
+    # 2. Запускаем Telethon-бота в главном потоке
+    print("Запускаю Telegram-бота (Telethon)...", flush=True)
+    await start_bot() # Эта функция сама заблокирует поток до отключения
 
 # ==========================================
 # 4. ТОЧКА ВХОДА
 # ==========================================
 if __name__ == "__main__":
-    init_db() # Создаем БД перед запуском
-    asyncio.run(main()) # Запускаем всё
+    init_db()
+    asyncio.run(main())
