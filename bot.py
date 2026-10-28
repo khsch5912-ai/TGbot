@@ -1,8 +1,7 @@
 import re
 import io
 import requests
-from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from telethon import TelegramClient, events, Button
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book
 
@@ -26,87 +25,95 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     upload_resp.raise_for_status()
     return upload_resp.json()["browser_download_url"]
 
-# --- ИНИЦИАЛИЗАЦИЯ PYROGRAM ---
-app = Client(
-    "audio_book_bot",
-    api_id=settings.api_id,
-    api_hash=settings.api_hash,
-    bot_token=settings.bot_token
-)
+# --- ИНИЦИАЛИЗАЦИЯ TELETHON ---
+client = TelegramClient('audio_book_session', settings.api_id, settings.api_hash)
 
+# Словарь для хранения состояний пользователей
 user_states = {}
 
-@app.on_message(filters.command("start"))
-async def cmd_start(client, message: Message):
-    user_id = message.from_user.id
+# ==========================================
+# ОБРАБОТЧИК КОМАНДЫ /start
+# ==========================================
+@client.on(events.NewMessage(pattern='/start'))
+async def cmd_start(event):
+    user_id = event.sender_id
     user_states[user_id] = {"step": None, "data": {}}
     
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("1. Записать новую книгу", callback_data="flow_new")],
-        [InlineKeyboardButton("2. Продолжить существующую", callback_data="flow_existing")]
-    ])
-    await message.reply_text("Выбери действие:", reply_markup=kb)
+    buttons = [
+        [Button.inline("1. Записать новую книгу", b"flow_new")],
+        [Button.inline("2. Продолжить существующую", b"flow_existing")]
+    ]
+    await event.respond("Выбери действие:", buttons=buttons)
 
-@app.on_callback_query()
-async def handle_callback(client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    data = callback.data
+# ==========================================
+# ОБРАБОТЧИК КНОПОК
+# ==========================================
+@client.on(events.CallbackQuery)
+async def handle_callback(event):
+    user_id = event.sender_id
+    data = event.data.decode('utf-8')
     
     if data == "flow_new":
         user_states[user_id] = {"step": "waiting_audio", "data": {"is_new": True}}
-        await callback.message.edit_text("Создание нового цикла.\n\nОтправь мне аудиофайл (любого размера).")
+        await event.edit("Создание нового цикла.\n\nОтправь мне аудиофайл (любого размера).")
     elif data == "flow_existing":
         last_book = get_last_book()
         if not last_book:
-            await callback.message.edit_text("В базе нет ни одной книги.")
+            await event.edit("В базе нет ни одной книги.")
             return
         user_states[user_id] = {"step": "waiting_audio", "data": {"is_new": False, "book_id": last_book["id"], "title": last_book["title"]}}
-        await callback.message.edit_text(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
+        await event.edit(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
 
-@app.on_message(filters.audio | filters.voice | filters.document)
-async def handle_audio(client, message: Message):
-    user_id = message.from_user.id
+# ==========================================
+# ОБРАБОТЧИК ФАЙЛОВ (АУДИО/ГОЛОС/ДОКУМЕНТ)
+# ==========================================
+@client.on(events.NewMessage(func=lambda e: e.audio or e.voice or e.document))
+async def handle_audio(event):
+    user_id = event.sender_id
     state = user_states.get(user_id)
     
     if not state or state.get("step") != "waiting_audio":
         return 
     
-    status_msg = await message.reply_text("⏳ Скачиваю файл (без лимитов MTProto)...")
+    status_msg = await event.respond("⏳ Скачиваю файл (без лимитов MTProto)...")
     
     try:
-        # Скачиваем в память
-        file_bytes = await client.download_media(message, in_memory=True)
+        # Скачиваем в память (Telethon отлично это умеет)
+        file_bytes = await event.download_media(bytes)
         
-        user_states[user_id]["data"]["audio_data"] = file_bytes.getvalue()
+        user_states[user_id]["data"]["audio_data"] = file_bytes
         user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_lesson_title"
         
         if state["data"]["is_new"]:
-            await status_msg.edit_text("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+            await status_msg.edit("Аудио готово!\nНапиши название книги и автора через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
         else:
-            await status_msg.edit_text("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
+            await status_msg.edit("Аудио готово!\nНапиши название этого урока (например: Урок 20. Книга намаза):")
             
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка: {e}")
+        await status_msg.edit(f"❌ Ошибка: {e}")
         user_states[user_id] = None
 
-@app.on_message(filters.text & ~filters.command("start"))
-async def handle_text(client, message: Message):
-    user_id = message.from_user.id
+# ==========================================
+# ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (ДИАЛОГ)
+# ==========================================
+@client.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith('/')))
+async def handle_text(event):
+    user_id = event.sender_id
     state = user_states.get(user_id)
     
     if not state: return
     
-    text = message.text.strip()
+    text = event.text.strip()
     
     if state["step"] == "waiting_title":
         if "," not in text:
-            await message.reply_text("Пожалуйста, укажи название и автора через запятую.")
+            await event.respond("Пожалуйста, укажи название и автора через запятую.")
             return
         title, author = [x.strip() for x in text.split(",", 1)]
         user_states[user_id]["data"]["title"] = title
         user_states[user_id]["data"]["author"] = author
         user_states[user_id]["step"] = "waiting_lesson_title"
-        await message.reply_text("Теперь напиши название урока:")
+        await event.respond("Теперь напиши название урока:")
         
     elif state["step"] == "waiting_lesson_title":
         lesson_title = text
@@ -120,12 +127,21 @@ async def handle_text(client, message: Message):
             
         lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title})
         
-        status_msg = await message.reply_text("⏳ Загружаю на GitHub...")
+        status_msg = await event.respond("⏳ Загружаю на GitHub...")
         try:
             audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
             update_audio_url(lesson_id, audio_url)
-            await status_msg.edit_text("✅ Готово! Аудио загружено на сайт.")
+            await status_msg.edit("✅ Готово! Аудио загружено на сайт.")
         except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка: {e}")
+            await status_msg.edit(f"❌ Ошибка: {e}")
             
         user_states[user_id] = None
+
+# ==========================================
+# ЗАПУСК (ВЫЗЫВАЕТСЯ ИЗ WEB.PY)
+# ==========================================
+async def start_bot():
+    await client.start(bot_token=settings.bot_token)
+    print("Бот успешно подключен к Telegram (Telethon)!", flush=True)
+    # run_until_disconnected блокирует поток, поэтому его вызывает web.py
+    await client.run_until_disconnected()
