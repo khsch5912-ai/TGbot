@@ -1,5 +1,4 @@
-pyrogram>=2.0
-tgcrypto>=1.2
+telethon
 flask>=3.0
 flask-cors>=4.0.0
 requests>=2.28
