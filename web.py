@@ -9,7 +9,7 @@ from database import init_db
 from bot import client # Импортируем клиента Telethon
 
 flask_app = Flask(__name__)
-CORS(flask_app)
+CORS(flask_app, resources={r"/*": {"origins": "*"}})
 
 @flask_app.route('/api/lessons.json')
 def api_lessons_json():
