@@ -1,6 +1,7 @@
 import re
 import io
 import time
+import datetime
 import requests
 from telethon import TelegramClient, events, Button
 from config import settings
@@ -13,8 +14,6 @@ def make_slug(title: str) -> str:
 
 def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
     headers = {"Authorization": f"token {settings.github_token}", "Accept": "application/vnd.github.v3+json"}
-    
-    # Делаем тег уникальным с помощью времени
     base_tag = filename.rsplit(".", 1)[0].replace(" ", "_")
     unique_tag = f"{base_tag}_{int(time.time())}"
     
@@ -33,11 +32,17 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
 client = TelegramClient('audio_book_session', settings.api_id, settings.api_hash)
 user_states = {}
 
+# Функция проверки, что сообщение свежее (не из кэша)
+def is_fresh(event):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - event.date).total_seconds() < 60
+
 # ==========================================
 # ГЛАВНОЕ МЕНЮ
 # ==========================================
 @client.on(events.NewMessage(pattern='/start'))
 async def cmd_start(event):
+    if not is_fresh(event): return
     user_id = event.sender_id
     user_states[user_id] = {"step": None, "data": {}}
     
@@ -54,6 +59,8 @@ async def cmd_start(event):
 @client.on(events.NewMessage(pattern='/delete'))
 @client.on(events.CallbackQuery(data=b"manage_all"))
 async def manage_all(event):
+    if not is_fresh(event): return
+
     lessons = get_all_lessons()
     if not lessons:
         text = "В базе пока нет ни одного урока."
@@ -86,7 +93,6 @@ async def manage_all(event):
 @client.on(events.CallbackQuery(pattern=b"select_del_(\\d+)"))
 async def confirm_delete(event):
     lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
-    
     buttons = [
         [Button.inline("✅ Да, удалить", f"do_del_{lesson_id}".encode('utf-8'))],
         [Button.inline("❌ Отмена", b"manage_all")]
@@ -96,7 +102,6 @@ async def confirm_delete(event):
 @client.on(events.CallbackQuery(pattern=b"do_del_(\\d+)"))
 async def execute_delete(event):
     lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
-    
     if delete_lesson(lesson_id):
         await event.answer("Урок удален!", alert=True)
         await manage_all(event)
@@ -115,7 +120,7 @@ async def back_start(event):
     await event.edit("Выбери действие:", buttons=buttons)
 
 # ==========================================
-# ДОБАВЛЕНИЕ (ЛОГИКА)
+# ДОБАВЛЕНИЕ
 # ==========================================
 @client.on(events.CallbackQuery(data=b"flow_new"))
 async def flow_new(event):
@@ -133,6 +138,8 @@ async def flow_existing(event):
 
 @client.on(events.NewMessage(func=lambda e: e.audio or e.voice or e.document))
 async def handle_audio(event):
+    if not is_fresh(event): return
+    
     user_id = event.sender_id
     state = user_states.get(user_id)
     
@@ -157,6 +164,8 @@ async def handle_audio(event):
 
 @client.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith('/')))
 async def handle_text(event):
+    if not is_fresh(event): return
+
     user_id = event.sender_id
     state = user_states.get(user_id)
     
@@ -175,11 +184,12 @@ async def handle_text(event):
         await event.respond("Теперь введи номер части (например: 1, 2 или 20):")
         
     elif state["step"] == "waiting_part":
-        part_num = re.sub(r'\D', '', text)
-        if not part_num:
+        # Проверяем, что пользователь ввел ТОЛЬКО цифры
+        if not text.isdigit():
             await event.respond("Пожалуйста, напиши номер части цифрами (например: 1):")
-            return
-        user_states[user_id]["data"]["part"] = int(part_num)
+            return 
+            
+        user_states[user_id]["data"]["part"] = int(text)
         user_states[user_id]["step"] = "waiting_lesson_title"
         await event.respond("Теперь напиши название этого урока (например: Книга намаза):")
         
