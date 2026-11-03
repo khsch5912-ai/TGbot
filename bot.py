@@ -32,7 +32,11 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
 client = TelegramClient('audio_book_session', settings.api_id, settings.api_hash)
 user_states = {}
 
-# Функция проверки, что сообщение свежее (не из кэша)
+# Функция проверки на админа
+def is_admin(e):
+    return e.sender_id in settings.admin_ids
+
+# Функция проверки, что сообщение свежее
 def is_fresh(event):
     now = datetime.datetime.now(datetime.timezone.utc)
     return (now - event.date).total_seconds() < 60
@@ -40,7 +44,7 @@ def is_fresh(event):
 # ==========================================
 # ГЛАВНОЕ МЕНЮ
 # ==========================================
-@client.on(events.NewMessage(pattern='/start'))
+@client.on(events.NewMessage(pattern='/start', func=is_admin))
 async def cmd_start(event):
     if not is_fresh(event): return
     user_id = event.sender_id
@@ -54,10 +58,10 @@ async def cmd_start(event):
     await event.respond("Выбери действие:", buttons=buttons)
 
 # ==========================================
-# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ (УДАЛЕНИЕ)
+# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ
 # ==========================================
-@client.on(events.NewMessage(pattern='/delete'))
-@client.on(events.CallbackQuery(data=b"manage_all"))
+@client.on(events.NewMessage(pattern='/delete', func=is_admin))
+@client.on(events.CallbackQuery(data=b"manage_all", func=is_admin))
 async def manage_all(event):
     if not is_fresh(event): return
 
@@ -90,7 +94,7 @@ async def manage_all(event):
     else:
         await event.respond(text, buttons=buttons)
 
-@client.on(events.CallbackQuery(pattern=b"select_del_(\\d+)"))
+@client.on(events.CallbackQuery(pattern=b"select_del_(\\d+)", func=is_admin))
 async def confirm_delete(event):
     lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
     buttons = [
@@ -99,7 +103,7 @@ async def confirm_delete(event):
     ]
     await event.edit("Вы уверены, что хотите удалить этот урок из базы?", buttons=buttons)
 
-@client.on(events.CallbackQuery(pattern=b"do_del_(\\d+)"))
+@client.on(events.CallbackQuery(pattern=b"do_del_(\\d+)", func=is_admin))
 async def execute_delete(event):
     lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
     if delete_lesson(lesson_id):
@@ -108,7 +112,7 @@ async def execute_delete(event):
     else:
         await event.answer("Ошибка: урок не найден.", alert=True)
 
-@client.on(events.CallbackQuery(data=b"back_start"))
+@client.on(events.CallbackQuery(data=b"back_start", func=is_admin))
 async def back_start(event):
     user_id = event.sender_id
     user_states[user_id] = {"step": None, "data": {}}
@@ -122,12 +126,12 @@ async def back_start(event):
 # ==========================================
 # ДОБАВЛЕНИЕ
 # ==========================================
-@client.on(events.CallbackQuery(data=b"flow_new"))
+@client.on(events.CallbackQuery(data=b"flow_new", func=is_admin))
 async def flow_new(event):
     user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": True}}
     await event.edit("Создание нового цикла.\n\nОтправь мне аудиофайл (любого размера).")
 
-@client.on(events.CallbackQuery(data=b"flow_existing"))
+@client.on(events.CallbackQuery(data=b"flow_existing", func=is_admin))
 async def flow_existing(event):
     last_book = get_last_book()
     if not last_book:
@@ -136,7 +140,7 @@ async def flow_existing(event):
     user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": False, "book_id": last_book["id"], "title": last_book["title"]}}
     await event.edit(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
 
-@client.on(events.NewMessage(func=lambda e: e.audio or e.voice or e.document))
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and (e.audio or e.voice or e.document)))
 async def handle_audio(event):
     if not is_fresh(event): return
     
@@ -162,7 +166,7 @@ async def handle_audio(event):
         await status_msg.edit(f"❌ Ошибка: {e}")
         user_states[user_id] = None
 
-@client.on(events.NewMessage(func=lambda e: e.text and not e.text.startswith('/')))
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/')))
 async def handle_text(event):
     if not is_fresh(event): return
 
@@ -184,7 +188,6 @@ async def handle_text(event):
         await event.respond("Теперь введи номер части (например: 1, 2 или 20):")
         
     elif state["step"] == "waiting_part":
-        # Проверяем, что пользователь ввел ТОЛЬКО цифры
         if not text.isdigit():
             await event.respond("Пожалуйста, напиши номер части цифрами (например: 1):")
             return 
