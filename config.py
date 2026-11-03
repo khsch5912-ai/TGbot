@@ -11,5 +11,13 @@ class Settings(BaseSettings):
     
     api_id: int = Field(..., alias="API_ID")
     api_hash: str = Field(..., alias="API_HASH")
+    
+    # Добавляем список админов
+    admin_ids_raw: str = Field("", alias="ADMIN_IDS")
+
+    @property
+    def admin_ids(self) -> list[int]:
+        if not self.admin_ids_raw: return []
+        return [int(x.strip()) for x in self.admin_ids_raw.split(",") if x.strip()]
 
 settings = Settings()
