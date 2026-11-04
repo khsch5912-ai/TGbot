@@ -6,7 +6,8 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from config import settings
 from database import init_db
-from bot import client # Импортируем клиента Telethon
+# Импортируем клиента и фоновый воркер
+from bot import client, upload_worker
 
 flask_app = Flask(__name__)
 CORS(flask_app, resources={r"/*": {"origins": "*"}})
@@ -43,15 +44,20 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 async def main():
-    # 1. Flask в фоне
+    # 1. Запускаем Flask в фоновом потоке
     threading.Thread(target=run_flask, daemon=True).start()
     print("Flask сервер запущен.", flush=True)
 
-    # 2. Telethon в главном потоке
+    # 2. Запускаем Telethon
     print("Запускаю Telegram-бота...", flush=True)
     await client.start(bot_token=settings.bot_token)
     print("Бот успешно подключен к Telegram!", flush=True)
     
+    # 3. Запускаем фоновый воркер для очереди загрузок
+    asyncio.create_task(upload_worker())
+    print("Фоновый воркер очереди запущен!", flush=True)
+    
+    # 4. Держим бота активным
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
