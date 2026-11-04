@@ -6,6 +6,7 @@ import requests
 from telethon import TelegramClient, events, Button
 from config import settings
 from database import get_or_create_book, save_lesson, update_audio_url, get_last_book, delete_lesson, get_all_lessons
+import sqlite3
 
 def make_slug(title: str) -> str:
     eng_words = re.findall(r'[a-zA-Z0-9]+', title)
@@ -45,8 +46,7 @@ def is_fresh(event):
 @client.on(events.NewMessage(pattern='/start', func=is_admin))
 async def cmd_start(event):
     if not is_fresh(event): return
-    user_id = event.sender_id
-    user_states[user_id] = {"step": None, "data": {}}
+    user_states[event.sender_id] = {"step": None, "data": {}}
     
     buttons = [
         [Button.inline("1. Записать новую книгу", b"flow_new")],
@@ -55,16 +55,14 @@ async def cmd_start(event):
     ]
     await event.respond("Выбери действие:", buttons=buttons)
 
-# СКРЫТАЯ КОМАНДА /full
 @client.on(events.NewMessage(pattern='/full', func=is_admin))
 async def cmd_full(event):
     if not is_fresh(event): return
-    user_id = event.sender_id
-    user_states[user_id] = {"step": "waiting_audio", "data": {"is_new": True, "is_lazy": True}}
-    await event.respond("🚀 **Режим отложенной загрузки.**\n\nОтправь мне аудиофайл, но я не буду его скачивать сейчас. Мы загрузим его на хостинг в самом конце по кнопке.")
+    user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": True, "is_lazy": True}}
+    await event.respond("🚀 **Режим отложенной загрузки.**\n\nОтправь мне аудиофайл.")
 
 # ==========================================
-# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ
+# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ (УДАЛЕНИЕ И РЕДАКТИРОВАНИЕ)
 # ==========================================
 @client.on(events.NewMessage(pattern='/delete', func=is_admin))
 @client.on(events.CallbackQuery(data=b"manage_all", func=is_admin))
@@ -83,21 +81,97 @@ async def manage_all(event):
         if l['book_title'] != current_book:
             current_book = l['book_title']
             buttons.append([Button.inline(f"📕 {current_book}", b"ignore")])
-        buttons.append([Button.inline(f"🗑 {l['lesson_title']} (Часть {l['part']})", f"select_del_{l['id']}".encode('utf-8'))])
+        buttons.append([Button.inline(f"{l['lesson_title']} (Часть {l['part']})", f"manage_{l['id']}".encode('utf-8'))])
     buttons.append([Button.inline("⬅️ В главное меню", b"back_start")])
     
-    text = "Выбери урок, который хочешь удалить:"
+    text = "Выбери урок для управления:"
     if isinstance(event, events.CallbackQuery.Event): await event.edit(text, buttons=buttons)
     else: await event.respond(text, buttons=buttons)
 
-@client.on(events.CallbackQuery(pattern=b"select_del_(\\d+)", func=is_admin))
+@client.on(events.CallbackQuery(pattern=b"manage_(\\d+)", func=is_admin))
+async def action_with_lesson(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    buttons = [
+        [Button.inline("✏️ Редактировать", f"edit_{lesson_id}".encode('utf-8'))],
+        [Button.inline("🗑 Удалить", f"del_{lesson_id}".encode('utf-8'))],
+        [Button.inline("⬅️ Назад", b"manage_all")]
+    ]
+    await event.edit("Что сделать с этим уроком?", buttons=buttons)
+
+# --- РЕДАКТИРОВАНИЕ ---
+@client.on(events.CallbackQuery(pattern=b"edit_(\\d+)", func=is_admin))
+async def start_edit(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    user_states[event.sender_id] = {"step": "edit_title", "data": {"lesson_id": lesson_id}}
+    await event.edit("Введи **новое название книги и автора** через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and user_states.get(e.sender_id, {}).get("step") == "edit_title"))
+async def process_edit_title(event):
+    if not is_fresh(event): return
+    text = event.text.strip()
+    if "," not in text:
+        await event.respond("Пожалуйста, укажи название и автора через запятую.")
+        return
+    title, author = [x.strip() for x in text.split(",", 1)]
+    user_states[event.sender_id]["data"]["title"] = title
+    user_states[event.sender_id]["data"]["author"] = author
+    user_states[event.sender_id]["step"] = "edit_part"
+    await event.respond("Введи **новый номер части** (только цифру):")
+
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and user_states.get(e.sender_id, {}).get("step") == "edit_part"))
+async def process_edit_part(event):
+    if not is_fresh(event): return
+    text = event.text.strip()
+    if not text.isdigit():
+        await event.respond("Пожалуйста, напиши номер части цифрами.")
+        return
+    user_states[event.sender_id]["data"]["part"] = int(text)
+    user_states[event.sender_id]["step"] = "edit_lesson_title"
+    await event.respond("Введи **новое название урока**:")
+
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and user_states.get(e.sender_id, {}).get("step") == "edit_lesson_title"))
+async def process_edit_lesson_title(event):
+    if not is_fresh(event): return
+    lesson_title = event.text.strip()
+    data = user_states[event.sender_id]["data"]
+    
+    # Обновляем в базе
+    conn = sqlite3.connect(settings.db_path)
+    c = conn.cursor()
+    slug = make_slug(data["title"])
+    
+    # Обновляем или создаем книгу
+    c.execute("SELECT id FROM books WHERE slug = ?", (slug,))
+    row = c.fetchone()
+    if row:
+        book_id = row[0]
+        c.execute("UPDATE books SET title = ?, author = ? WHERE id = ?", (data["title"], data["author"], book_id))
+    else:
+        c.execute("INSERT INTO books (title, author, slug) VALUES (?, ?, ?)", (data["title"], data["author"], slug))
+        book_id = c.lastrowid
+        
+    # Обновляем урок
+    c.execute("UPDATE lessons SET book_id = ?, lesson_title = ?, part = ? WHERE id = ?", 
+              (book_id, lesson_title, data["part"], data["lesson_id"]))
+    conn.commit()
+    conn.close()
+    
+    # Синхронизируем с GitHub (вызываем функцию из database.py)
+    from database import sync_to_github
+    sync_to_github()
+    
+    user_states[event.sender_id] = {"step": None, "data": {}}
+    await event.respond("✅ Данные урока успешно обновлены!")
+
+# --- УДАЛЕНИЕ ---
+@client.on(events.CallbackQuery(pattern=b"del_(\\d+)", func=is_admin))
 async def confirm_delete(event):
     lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
     buttons = [
         [Button.inline("✅ Да, удалить", f"do_del_{lesson_id}".encode('utf-8'))],
         [Button.inline("❌ Отмена", b"manage_all")]
     ]
-    await event.edit("Вы уверены, что хотите удалить этот урок из базы?", buttons=buttons)
+    await event.edit("Вы уверены, что хотите удалить этот урок?", buttons=buttons)
 
 @client.on(events.CallbackQuery(pattern=b"do_del_(\\d+)", func=is_admin))
 async def execute_delete(event):
@@ -119,7 +193,7 @@ async def back_start(event):
     await event.edit("Выбери действие:", buttons=buttons)
 
 # ==========================================
-# ДОБАВЛЕНИЕ
+# ДОБАВЛЕНИЕ (ЛОГИКА ОСТАЕТСЯ ПРЕЖНЕЙ)
 # ==========================================
 @client.on(events.CallbackQuery(data=b"flow_new", func=is_admin))
 async def flow_new(event):
@@ -145,15 +219,13 @@ async def handle_audio(event):
     is_lazy = state["data"].get("is_lazy", False)
 
     if is_lazy:
-        # В РЕЖИМЕ /full мы просто сохраняем ID файла и НЕ скачиваем его
-        user_states[user_id]["data"]["audio_file_id"] = event.document.id if event.document else event.audio.id
+        user_states[user_id]["data"]["audio_msg_id"] = event.id 
         user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_part"
         if state["data"]["is_new"]:
             await event.respond("Файл отложен!\nНапиши название книги и автора через запятую.")
         else:
             await event.respond("Файл отложен!\nВведи номер части (например: 1, 2 или 20):")
     else:
-        # ОБЫЧНЫЙ РЕЖИМ: Скачиваем сразу
         status_msg = await event.respond("⏳ Скачиваю файл...")
         try:
             file_bytes = await event.download_media(bytes)
@@ -167,12 +239,11 @@ async def handle_audio(event):
             await status_msg.edit(f"❌ Ошибка: {e}")
             user_states[user_id] = None
 
-@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/')))
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/') and user_states.get(e.sender_id, {}).get("step") in ["waiting_title", "waiting_part", "waiting_lesson_title"]))
 async def handle_text(event):
     if not is_fresh(event): return
     user_id = event.sender_id
     state = user_states.get(user_id)
-    if not state: return
     text = event.text.strip()
     
     if state["step"] == "waiting_title":
@@ -210,12 +281,10 @@ async def handle_text(event):
         })
         
         if data.get("is_lazy"):
-            # В РЕЖИМЕ /full показываем кнопку отложенной загрузки
             user_states[user_id]["data"]["lesson_id"] = lesson_id
             buttons = [[Button.inline("📤 Выгрузить аудио на хостинг", b"lazy_upload")]]
-            await event.respond(f"✅ Данные сохранены! Часть {data['part']} добавлена в базу.\n\nТеперь можешь спокойно нажать кнопку ниже, чтобы загрузить само аудио.", buttons=buttons)
+            await event.respond(f"✅ Данные сохранены! Часть {data['part']} добавлена в базу.\n\nНажми кнопку ниже, чтобы загрузить само аудио.", buttons=buttons)
         else:
-            # В обычном режиме грузим сразу
             status_msg = await event.respond("⏳ Загружаю на GitHub...")
             try:
                 audio_url = github_upload_audio(io.BytesIO(data["audio_data"]), f"lesson_{lesson_id}.mp3")
@@ -231,27 +300,21 @@ async def handle_text(event):
                 await status_msg.edit(f"❌ Ошибка: {e}")
                 user_states[user_id] = None
 
-# ==========================================
-# ОТЛОЖЕННАЯ ЗАГРУЗКА (Кнопка)
-# ==========================================
 @client.on(events.CallbackQuery(data=b"lazy_upload", func=is_admin))
 async def lazy_upload(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
-    
-    if not state or "audio_file_id" not in state["data"]:
+    if not state or "audio_msg_id" not in state["data"]:
         await event.answer("Ошибка: данные файла утеряны.", alert=True)
         return
 
-    file_id = state["data"]["audio_file_id"]
+    msg_id = state["data"]["audio_msg_id"]
     lesson_id = state["data"]["lesson_id"]
     part = state["data"]["part"]
 
     await event.edit("⏳ Скачиваю файл из Telegram...")
-    
     try:
-        # Скачиваем файл по ID
-        message_obj = await client.get_messages(event.chat_id, ids=file_id)
+        message_obj = await client.get_messages(event.chat_id, ids=msg_id)
         file_bytes = await message_obj.download_media(bytes)
         
         await event.edit("⏳ Загружаю файл на GitHub...")
@@ -265,6 +328,5 @@ async def lazy_upload(event):
             [Button.inline("📚 Управление библиотекой", b"manage_all")]
         ]
         await event.edit(f"✅ Успех! Часть {part} загружена на сайт.", buttons=buttons)
-        
     except Exception as e:
         await event.edit(f"❌ Ошибка при загрузке: {e}")
