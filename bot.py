@@ -57,24 +57,18 @@ async def upload_worker():
             chat_id = task["chat_id"]
             part = task["part"]
             
-            # 1. Скачиваем файл
             message_obj = await client.get_messages(chat_id, ids=msg_id)
             file_bytes = await message_obj.download_media(bytes)
             
-            # 2. Загружаем на GitHub
             audio_url = github_upload_audio(io.BytesIO(file_bytes), f"lesson_{lesson_id}.mp3")
-            
-            # 3. Обновляем ссылку в БД
             update_audio_url(lesson_id, audio_url)
             
             print(f"✅ Файл части {part} успешно загружен.", flush=True)
             
-            # Уведомляем админа об успехе
             try:
                 await client.send_message(chat_id, f"✅ Фоновая загрузка: Часть {part} готова и появилась на сайте!")
             except: pass
             
-            # Пауза между загрузками, чтобы не забанили
             await asyncio.sleep(3) 
             
         except Exception as e:
@@ -101,23 +95,125 @@ async def cmd_start(event):
     ]
     await event.respond("Выбери действие:", buttons=buttons)
 
+# ==========================================
+# ФОНОВАЯ ЗАГРУЗКА (ВЫБОР КНИГИ)
+# ==========================================
 @client.on(events.CallbackQuery(data=b"flow_queue", func=is_admin))
 async def start_queue_mode(event):
-    user_states[event.sender_id] = {"step": "queue_audio", "data": {}}
-    await event.edit("⚡️ **Режим фоновой очереди.**\n\nСкидывай мне аудиофайлы один за другим. Я буду спрашивать данные и сразу отправлять их в очередь на загрузку. Ты можешь продолжать кидать следующие файлы, не дожидаясь окончания.")
+    buttons = [
+        [Button.inline("1. Новая книга", b"queue_new_book")],
+        [Button.inline("2. Продолжить существующую", b"queue_existing_book")]
+    ]
+    await event.edit("⚡️ **Режим фоновой очереди.**\n\nКуда будем добавлять файлы?", buttons=buttons)
+
+@client.on(events.CallbackQuery(data=b"queue_new_book", func=is_admin))
+async def queue_new_book(event):
+    user_states[event.sender_id] = {"step": "queue_audio", "data": {"is_new": True}}
+    await event.edit("Отправь мне первый аудиофайл. Затем напиши название книги и автора.")
+
+@client.on(events.CallbackQuery(data=b"queue_existing_book", func=is_admin))
+async def queue_existing_book(event):
+    last_book = get_last_book()
+    if not last_book:
+        await event.edit("В базе нет ни одной книги. Создайте новую.")
+        return
+    user_states[event.sender_id] = {"step": "queue_audio", "data": {"is_new": False, "book_id": last_book["id"], "title": last_book["title"]}}
+    await event.edit(f"Продолжаем книгу: {last_book['title']}.\n\nОтправь мне аудиофайл.")
 
 # ==========================================
-# ОБРАБОТКА ФАЙЛОВ И ОЧЕРЕДИ
+# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ
+# ==========================================
+@client.on(events.NewMessage(pattern='/delete', func=is_admin))
+@client.on(events.CallbackQuery(data=b"manage_all", func=is_admin))
+async def manage_all(event):
+    if not is_fresh(event): return
+    lessons = get_all_lessons()
+    if not lessons:
+        text = "В базе пока нет ни одного урока."
+        if isinstance(event, events.CallbackQuery.Event): await event.edit(text)
+        else: await event.respond(text)
+        return
+    
+    buttons = []
+    current_book = ""
+    for l in lessons:
+        if l['book_title'] != current_book:
+            current_book = l['book_title']
+            buttons.append([Button.inline(f"📕 {current_book}", b"ignore")])
+        buttons.append([Button.inline(f"{l['lesson_title']} (Часть {l['part']})", f"manage_{l['id']}".encode('utf-8'))])
+    buttons.append([Button.inline("⬅️ В главное меню", b"back_start")])
+    
+    text = "Выбери урок для управления:"
+    if isinstance(event, events.CallbackQuery.Event): await event.edit(text, buttons=buttons)
+    else: await event.respond(text, buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"manage_(\\d+)", func=is_admin))
+async def action_with_lesson(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    buttons = [
+        [Button.inline("✏️ Редактировать", f"edit_{lesson_id}".encode('utf-8'))],
+        [Button.inline("🗑 Удалить", f"del_{lesson_id}".encode('utf-8'))],
+        [Button.inline("⬅️ Назад", b"manage_all")]
+    ]
+    await event.edit("Что сделать с этим уроком?", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"del_(\\d+)", func=is_admin))
+async def confirm_delete(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    buttons = [
+        [Button.inline("✅ Да, удалить", f"do_del_{lesson_id}".encode('utf-8'))],
+        [Button.inline("❌ Отмена", b"manage_all")]
+    ]
+    await event.edit("Вы уверены, что хотите удалить этот урок?", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"do_del_(\\d+)", func=is_admin))
+async def execute_delete(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    if delete_lesson(lesson_id):
+        await event.answer("Урок удален!", alert=True)
+        await manage_all(event)
+    else:
+        await event.answer("Ошибка: урок не найден.", alert=True)
+
+@client.on(events.CallbackQuery(data=b"back_start", func=is_admin))
+async def back_start(event):
+    user_states[event.sender_id] = {"step": None, "data": {}}
+    buttons = [
+        [Button.inline("1. Записать новую книгу", b"flow_new")],
+        [Button.inline("2. Продолжить существующую", b"flow_existing")],
+        [Button.inline("🚀 Фоновая загрузка (Очередь)", b"flow_queue")],
+        [Button.inline("📚 Управление библиотекой", b"manage_all")]
+    ]
+    await event.edit("Выбери действие:", buttons=buttons)
+
+# ==========================================
+# ОБЫЧНОЕ ДОБАВЛЕНИЕ
+# ==========================================
+@client.on(events.CallbackQuery(data=b"flow_new", func=is_admin))
+async def flow_new(event):
+    user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": True}}
+    await event.edit("Создание нового цикла.\n\nОтправь мне аудиофайл.")
+
+@client.on(events.CallbackQuery(data=b"flow_existing", func=is_admin))
+async def flow_existing(event):
+    last_book = get_last_book()
+    if not last_book:
+        await event.edit("В базе нет ни одной книги.")
+        return
+    user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": False, "book_id": last_book["id"], "title": last_book["title"]}}
+    await event.edit(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.")
+
+# ==========================================
+# ОБРАБОТЧИК ФАЙЛОВ
 # ==========================================
 @client.on(events.NewMessage(func=lambda e: is_admin(e) and (e.audio or e.voice or e.document)))
 async def handle_audio(event):
     if not is_fresh(event): return
     user_id = event.sender_id
     state = user_states.get(user_id)
-    
     if not state: return
 
-    # Режим очереди
+    # --- РЕЖИМ ОЧЕРЕДИ ---
     if state.get("step") == "queue_audio":
         book_id = state["data"].get("book_id")
         
@@ -129,9 +225,9 @@ async def handle_audio(event):
             
         state["data"]["temp_msg_id"] = event.id
         state["step"] = "queue_file_data"
-        await event.respond("Введи **номер части и название урока** через вертикальную черту `|`.\nПример: `5 | Книга намаза`")
+        await event.respond("Введи **номер части и название урока** через `|`.\nПример: `5 | Книга намаза`")
 
-    # Обычный режим (как было)
+    # --- ОБЫЧНЫЙ РЕЖИМ ---
     elif state.get("step") == "waiting_audio":
         status_msg = await event.respond("⏳ Скачиваю файл...")
         try:
@@ -147,7 +243,7 @@ async def handle_audio(event):
             user_states[user_id] = None
 
 # ==========================================
-# ОБРАБОТКА ТЕКСТА (ДЛЯ ОЧЕРЕДИ И ОБЫЧНОГО РЕЖИМА)
+# ОБРАБОТЧИК ТЕКСТА (ВСЕ СОСТОЯНИЯ)
 # ==========================================
 @client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/')))
 async def handle_text(event):
@@ -157,7 +253,7 @@ async def handle_text(event):
     if not state: return
     text = event.text.strip()
 
-    # --- ЛОГИКА ОЧЕРЕДИ ---
+    # --- ОЧЕРЕДЬ ---
     if state["step"] == "queue_book_title":
         if "," not in text:
             await event.respond("Пожалуйста, укажи название и автора через запятую.")
@@ -165,30 +261,25 @@ async def handle_text(event):
         title, author = [x.strip() for x in text.split(",", 1)]
         slug = make_slug(title)
         book_id = get_or_create_book(title, author, slug)
-        
         state["data"]["book_id"] = book_id
         state["step"] = "queue_file_data"
-        await event.respond("Книга выбрана! Теперь введи **номер части и название урока** для отправленного файла.\nПример: `1 | Введение`")
+        await event.respond("Книга выбрана! Теперь введи **номер части и название урока** для файла.\nПример: `1 | Введение`")
         return
 
     if state["step"] == "queue_file_data":
         if "|" not in text:
             await event.respond("Ошибка формата. Пиши: `Номер | Название`")
             return
-        
         part_str, lesson_title = [x.strip() for x in text.split("|", 1)]
         if not part_str.isdigit():
-            await event.respond("Номер части должен быть цифрой. Пример: `1 | Введение`")
+            await event.respond("Номер части должен быть цифрой.")
             return
             
         part = int(part_str)
         book_id = state["data"]["book_id"]
         msg_id = state["data"]["temp_msg_id"]
 
-        # 1. Сохраняем урок в БД (пока без аудио)
         lesson_id = save_lesson({"book_id": book_id, "lesson_title": lesson_title, "part": part})
-        
-        # 2. Отправляем задачу в фоновую очередь
         await upload_queue.put({
             "msg_id": msg_id,
             "lesson_id": lesson_id,
@@ -196,29 +287,71 @@ async def handle_text(event):
             "part": part
         })
         
-        # 3. Возвращаемся в режим ожидания следующего файла
         state["step"] = "queue_audio"
-        
-        queue_size = upload_queue.qsize()
-        await event.respond(f"✅ Файл (Часть {part}) добавлен в очередь (всего в очереди: {queue_size}).\n\nМожешь кидать следующий файл!")
+        await event.respond(f"✅ Файл (Часть {part}) добавлен в очередь (всего: {upload_queue.qsize()}).\n\nМожешь кидать следующий файл!")
 
-    # --- ОБЫЧНЫЙ РЕЖИМ ---
-    elif state["step"] == "waiting_title":
+    # --- РЕДАКТИРОВАНИЕ ---
+    elif state["step"] == "edit_title":
         if "," not in text:
-            await event.respond("Пожалуйста, укажи название и автора через запятую.")
+            await event.respond("Укажи название и автора через запятую.")
             return
         title, author = [x.strip() for x in text.split(",", 1)]
-        user_states[user_id]["data"]["title"] = title
-        user_states[user_id]["data"]["author"] = author
-        user_states[user_id]["step"] = "waiting_part"
+        state["data"]["title"] = title
+        state["data"]["author"] = author
+        state["step"] = "edit_part"
+        await event.respond("Введи **новый номер части**:")
+        
+    elif state["step"] == "edit_part":
+        if not text.isdigit():
+            await event.respond("Номер части должен быть цифрой.")
+            return
+        state["data"]["part"] = int(text)
+        state["step"] = "edit_lesson_title"
+        await event.respond("Введи **новое название урока**:")
+        
+    elif state["step"] == "edit_lesson_title":
+        lesson_title = text
+        data = state["data"]
+        
+        conn = sqlite3.connect(settings.db_path)
+        c = conn.cursor()
+        slug = make_slug(data["title"])
+        
+        c.execute("SELECT id FROM books WHERE slug = ?", (slug,))
+        row = c.fetchone()
+        if row:
+            book_id = row[0]
+            c.execute("UPDATE books SET title = ?, author = ? WHERE id = ?", (data["title"], data["author"], book_id))
+        else:
+            c.execute("INSERT INTO books (title, author, slug) VALUES (?, ?, ?)", (data["title"], data["author"], slug))
+            book_id = c.lastrowid
+            
+        c.execute("UPDATE lessons SET book_id = ?, lesson_title = ?, part = ? WHERE id = ?", 
+                  (book_id, lesson_title, data["part"], data["lesson_id"]))
+        conn.commit()
+        conn.close()
+        
+        sync_to_github()
+        user_states[user_id] = {"step": None, "data": {}}
+        await event.respond("✅ Данные урока успешно обновлены!")
+
+    # --- ОБЫЧНОЕ ДОБАВЛЕНИЕ ---
+    elif state["step"] == "waiting_title":
+        if "," not in text:
+            await event.respond("Укажи название и автора через запятую.")
+            return
+        title, author = [x.strip() for x in text.split(",", 1)]
+        state["data"]["title"] = title
+        state["data"]["author"] = author
+        state["step"] = "waiting_part"
         await event.respond("Теперь введи номер части (например: 1, 2 или 20):")
         
     elif state["step"] == "waiting_part":
         if not text.isdigit():
-            await event.respond("Пожалуйста, напиши номер части цифрами (например: 1):")
+            await event.respond("Напиши номер части цифрами.")
             return 
-        user_states[user_id]["data"]["part"] = int(text)
-        user_states[user_id]["step"] = "waiting_lesson_title"
+        state["data"]["part"] = int(text)
+        state["step"] = "waiting_lesson_title"
         await event.respond("Теперь напиши название этого урока (например: Книга намаза):")
         
     elif state["step"] == "waiting_lesson_title":
@@ -248,3 +381,12 @@ async def handle_text(event):
         except Exception as e:
             await status_msg.edit(f"❌ Ошибка: {e}")
             user_states[user_id] = None
+
+# ==========================================
+# РЕДАКТИРОВАНИЕ (КНОПКА)
+# ==========================================
+@client.on(events.CallbackQuery(pattern=b"edit_(\\d+)", func=is_admin))
+async def start_edit(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    user_states[event.sender_id] = {"step": "edit_title", "data": {"lesson_id": lesson_id}}
+    await event.edit("Введи **новое название книги и автора** через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
