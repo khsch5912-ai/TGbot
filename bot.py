@@ -84,7 +84,7 @@ async def upload_worker():
 # ==========================================
 @client.on(events.NewMessage(pattern='/start', func=is_admin))
 async def cmd_start(event):
-    if not is_fresh(event): return
+    if not is_fresh(event): return # Защита только для команды старт, чтобы не спамило при рестарте
     user_states[event.sender_id] = {"step": None, "data": {}}
     
     buttons = [
@@ -121,12 +121,11 @@ async def queue_existing_book(event):
     await event.edit(f"Продолжаем книгу: {last_book['title']}.\n\nОтправь мне аудиофайл.")
 
 # ==========================================
-# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ
+# УПРАВЛЕНИЕ БИБЛИОТЕКОЙ (ИСПРАВЛЕНО)
 # ==========================================
 @client.on(events.NewMessage(pattern='/delete', func=is_admin))
 @client.on(events.CallbackQuery(data=b"manage_all", func=is_admin))
 async def manage_all(event):
-    if not is_fresh(event): return
     lessons = get_all_lessons()
     if not lessons:
         text = "В базе пока нет ни одного урока."
@@ -175,6 +174,12 @@ async def execute_delete(event):
     else:
         await event.answer("Ошибка: урок не найден.", alert=True)
 
+@client.on(events.CallbackQuery(pattern=b"edit_(\\d+)", func=is_admin))
+async def start_edit(event):
+    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
+    user_states[event.sender_id] = {"step": "edit_title", "data": {"lesson_id": lesson_id}}
+    await event.edit("Введи **новое название книги и автора** через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
+
 @client.on(events.CallbackQuery(data=b"back_start", func=is_admin))
 async def back_start(event):
     user_states[event.sender_id] = {"step": None, "data": {}}
@@ -208,7 +213,6 @@ async def flow_existing(event):
 # ==========================================
 @client.on(events.NewMessage(func=lambda e: is_admin(e) and (e.audio or e.voice or e.document)))
 async def handle_audio(event):
-    if not is_fresh(event): return
     user_id = event.sender_id
     state = user_states.get(user_id)
     if not state: return
@@ -243,11 +247,10 @@ async def handle_audio(event):
             user_states[user_id] = None
 
 # ==========================================
-# ОБРАБОТЧИК ТЕКСТА (ВСЕ СОСТОЯНИЯ)
+# ОБРАБОТЧИК ТЕКСТА
 # ==========================================
 @client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/')))
 async def handle_text(event):
-    if not is_fresh(event): return
     user_id = event.sender_id
     state = user_states.get(user_id)
     if not state: return
@@ -381,12 +384,3 @@ async def handle_text(event):
         except Exception as e:
             await status_msg.edit(f"❌ Ошибка: {e}")
             user_states[user_id] = None
-
-# ==========================================
-# РЕДАКТИРОВАНИЕ (КНОПКА)
-# ==========================================
-@client.on(events.CallbackQuery(pattern=b"edit_(\\d+)", func=is_admin))
-async def start_edit(event):
-    lesson_id = int(event.pattern_match.group(1).decode('utf-8'))
-    user_states[event.sender_id] = {"step": "edit_title", "data": {"lesson_id": lesson_id}}
-    await event.edit("Введи **новое название книги и автора** через запятую.\nПример: Далиль ат-Талиб, Шейх Марʿи")
