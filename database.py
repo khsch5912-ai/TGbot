@@ -199,3 +199,39 @@ def get_all_lessons() -> list:
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# ... твои старые функции ...
+
+def get_all_books():
+    conn = sqlite3.connect(settings.db_path)
+    c = conn.cursor()
+    c.execute("SELECT id, title, author FROM books ORDER BY title")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "author": r[2]} for r in rows]
+
+def rename_book(book_id: int, new_title: str, new_author: str, new_slug: str):
+    conn = sqlite3.connect(settings.db_path)
+    c = conn.cursor()
+    c.execute("UPDATE books SET title = ?, author = ?, slug = ? WHERE id = ?", (new_title, new_author, new_slug, book_id))
+    conn.commit()
+    conn.close()
+    sync_to_github()
+
+def move_lessons_to_book(source_book_id: int, target_book_id: int):
+    conn = sqlite3.connect(settings.db_path)
+    c = conn.cursor()
+    c.execute("UPDATE lessons SET book_id = ? WHERE book_id = ?", (target_book_id, source_book_id))
+    c.execute("DELETE FROM books WHERE id = ?", (source_book_id,))
+    conn.commit()
+    conn.close()
+    sync_to_github()
+
+def delete_book(book_id: int):
+    conn = sqlite3.connect(settings.db_path)
+    c = conn.cursor()
+    c.execute("DELETE FROM lessons WHERE book_id = ?", (book_id,))
+    c.execute("DELETE FROM books WHERE id = ?", (book_id,))
+    conn.commit()
+    conn.close()
+    sync_to_github()
