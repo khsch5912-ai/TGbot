@@ -38,7 +38,7 @@ def github_upload_audio(file_bytes: io.BytesIO, filename: str) -> str:
 client = TelegramClient('audio_book_session', settings.api_id, settings.api_hash)
 user_states = {}
 upload_queue = asyncio.Queue()
-active_books = {} # { user_id: book_id }
+active_books = {} 
 
 def is_admin(e):
     return e.sender_id in settings.admin_ids
@@ -51,7 +51,7 @@ def is_fresh(event):
 # ФОНОВЫЙ ВОРКЕР
 # ==========================================
 async def upload_worker():
-    print("🚀 Фоновый воркер запущен и ждет файлы...", flush=True)
+    print("🚀 Фоновый воркер запущен...", flush=True)
     while True:
         task = await upload_queue.get()
         try:
@@ -65,8 +65,6 @@ async def upload_worker():
             
             audio_url = github_upload_audio(io.BytesIO(file_bytes), f"lesson_{lesson_id}.mp3")
             update_audio_url(lesson_id, audio_url)
-            
-            print(f"✅ Файл части {part} успешно загружен.", flush=True)
             
             try:
                 await client.send_message(chat_id, f"✅ Фоновая загрузка: Часть {part} готова и появилась на сайте!")
@@ -126,14 +124,13 @@ async def book_action(event):
     ]
     await event.edit("Что сделать с книгой?", buttons=buttons)
 
-# --- ПЕРЕИМЕНОВАТЬ КНИГУ ---
 @client.on(events.CallbackQuery(pattern=b"book_ren_(\\d+)", func=is_admin))
 async def rename_book_start(event):
     book_id = int(event.pattern_match.group(1).decode('utf-8'))
     user_states[event.sender_id] = {"step": "rename_book", "data": {"book_id": book_id}}
     await event.edit("Введи **новое название книги и автора** через запятую.")
 
-@client.on(events.NewMessage(func=lambda e: is_admin(e) and user_states.get(e.sender_id, {}).get("step") == "rename_book"))
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and user_states.get(e.sender_id, {}).get("step") == "rename_book"))
 async def rename_book_process(event):
     text = event.text.strip()
     if "," not in text:
@@ -149,7 +146,6 @@ async def rename_book_process(event):
     user_states[event.sender_id] = {"step": None, "data": {}}
     await event.respond(f"✅ Книга успешно переименована в «{title}»!")
 
-# --- ПЕРЕНЕСТИ ЧАСТИ ---
 @client.on(events.CallbackQuery(pattern=b"book_move_(\\d+)", func=is_admin))
 async def move_book_start(event):
     source_book_id = int(event.pattern_match.group(1).decode('utf-8'))
@@ -175,7 +171,6 @@ async def move_book_process(event):
     move_lessons_to_book(source_id, target_id)
     await event.edit("✅ Все части перенесены! Исходная книга удалена.")
 
-# --- УДАЛИТЬ КНИГУ ---
 @client.on(events.CallbackQuery(pattern=b"book_del_(\\d+)", func=is_admin))
 async def delete_book_confirm(event):
     book_id = int(event.pattern_match.group(1).decode('utf-8'))
@@ -192,12 +187,11 @@ async def delete_book_execute(event):
     await event.edit("✅ Книга и все её части удалены.")
 
 # ==========================================
-# ПРОДОЛЖИТЬ СУЩЕСТВУЮЩУЮ (С ВЫБОРОМ)
+# ПРОДОЛЖИТЬ СУЩЕСТВУЮЩУЮ
 # ==========================================
 @client.on(events.CallbackQuery(data=b"flow_existing", func=is_admin))
 async def flow_existing(event):
     user_id = event.sender_id
-    
     if user_id in active_books:
         last_book = next((b for b in get_all_books() if b["id"] == active_books[user_id]), None)
         if last_book:
@@ -205,7 +199,6 @@ async def flow_existing(event):
             buttons = [[Button.inline("🔄 Сменить книгу", b"flow_existing_change")]]
             await event.edit(f"Продолжаем книгу: {last_book['title']}\n\nОтправь мне аудиофайл.", buttons=buttons)
             return
-    
     await show_book_selection(event)
 
 @client.on(events.CallbackQuery(data=b"flow_existing_change", func=is_admin))
@@ -228,11 +221,9 @@ async def show_book_selection(event):
 async def select_active_book(event):
     book_id = int(event.pattern_match.group(1).decode('utf-8'))
     active_books[event.sender_id] = book_id
-    
     book = next((b for b in get_all_books() if b["id"] == book_id), None)
     user_states[event.sender_id] = {"step": "waiting_audio", "data": {"is_new": False, "book_id": book_id}}
-    
-    await event.edit(f"✅ Выбрана книга: {book['title']}\n\nОтправь мне аудиофайл. Я буду добавлять части сюда, пока ты не сменишь книгу.")
+    await event.edit(f"✅ Выбрана книга: {book['title']}\n\nОтправь мне аудиофайл.")
 
 # ==========================================
 # ФОНОВАЯ ЗАГРУЗКА
@@ -259,7 +250,6 @@ async def queue_existing_book(event):
             user_states[user_id] = {"step": "queue_audio", "data": {"is_new": False, "book_id": book["id"]}}
             await event.edit(f"Продолжаем книгу: {book['title']} (в очереди).\n\nОтправь мне аудиофайл.")
             return
-            
     await event.edit("Сначала выбери книгу в меню «Продолжить существующую».")
 
 # ==========================================
@@ -363,17 +353,25 @@ async def handle_audio(event):
         status_msg = await event.respond("⏳ Скачиваю файл...")
         try:
             file_bytes = await event.download_media(bytes)
+            
+            # Никакой обработки текста. Сразу переходим к вопросам.
             user_states[user_id]["data"]["audio_data"] = file_bytes
             user_states[user_id]["step"] = "waiting_title" if state["data"]["is_new"] else "waiting_part"
+            
             if state["data"]["is_new"]:
                 await status_msg.edit("Аудио готово!\nНапиши название книги и автора через запятую.")
             else:
                 await status_msg.edit("Аудио готово!\nВведи номер части (например: 1, 2 или 20):")
+                
         except Exception as e:
             await status_msg.edit(f"❌ Ошибка: {e}")
             user_states[user_id] = None
 
-@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/')))
+# ==========================================
+# ОБРАБОТЧИК ТЕКСТА (СТРОГО БЕЗ ФАЙЛОВ)
+# ==========================================
+# ЖЕСТКИЙ ФИЛЬТР: not (e.audio or e.voice or e.document)
+@client.on(events.NewMessage(func=lambda e: is_admin(e) and e.text and not e.text.startswith('/') and not (e.audio or e.voice or e.document)))
 async def handle_text(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
